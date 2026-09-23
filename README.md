@@ -41,6 +41,7 @@
 2. 左侧选择 **Build and Package Docker Images** workflow
 3. 点击 **Run workflow**，填写参数后点击绿色 **Run workflow** 按钮
 4. 运行完成后，在该次运行页面底部的 **Artifacts** 区域下载 TGZ 文件
+5. 运行页面的 **Summary** 区域会显示本次运行的摘要：输入参数、产出文件名与大小、镜像清单、目标服务器导入命令
 
 ### 输入参数说明
 

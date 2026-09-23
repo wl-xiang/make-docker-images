@@ -274,7 +274,68 @@ jobs:
           if-no-files-found: error
 
       # ---------------------------------------------------------------
-      # Step 8: 清理 Docker 缓存（尽力而为，失败不影响结果）
+      # Step 8: 输出运行摘要（显示在运行页面底部的 Summary 区域）
+      # ---------------------------------------------------------------
+      - name: 输出运行摘要
+        if: ${{ always() }}
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          PLATFORM: ${{ inputs.platform }}
+          MODE: ${{ inputs.mode }}
+          DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
+          COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "## 📦 镜像构建打包摘要"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 运行编号 | #${RUN_NUMBER} |"
+            echo "| 目标仓库 | \`${REPO_URL}\` |"
+            echo "| 模式 | \`${MODE}\` |"
+            echo "| 目标平台 | \`${PLATFORM}\` |"
+            if [[ "$MODE" == "build" ]]; then
+              echo "| Dockerfile | \`${DOCKERFILE_PATH:-Dockerfile}\` |"
+              echo "| 镜像名称 | \`${IMAGE_NAME}\` |"
+            else
+              echo "| Compose 文件 | \`${COMPOSE_FILE_PATH:-docker-compose.yml}\` |"
+            fi
+            echo "| 运行状态 | \`${JOB_STATUS}\` |"
+            echo ""
+
+            if [[ "$JOB_STATUS" == "success" && -f "$IMAGE_LIST_FILE" && -n "${TGZ_NAME:-}" ]]; then
+              mapfile -t IMAGES < "$IMAGE_LIST_FILE"
+              TGZ_PATH="dist/$TGZ_NAME"
+              TGZ_SIZE=$(du -h "$TGZ_PATH" | cut -f1)
+              echo "### ✅ 产出 Artifact"
+              echo ""
+              echo "| 文件名 | 大小 | 包含镜像数 |"
+              echo "|---|---|---|"
+            echo "| \`${TGZ_NAME}\` | ${TGZ_SIZE} | ${#IMAGES[@]} |"
+              echo ""
+              echo "### 镜像清单"
+              echo ""
+              for img in "${IMAGES[@]}"; do
+                echo "- \`${img}\`"
+              done
+              echo ""
+              echo "### 目标服务器导入方法"
+              echo ""
+              echo '```bash'
+              echo "docker load -i <(gunzip -c ${TGZ_NAME})"
+              echo '```'
+            else
+              echo "### ⚠️ 本次运行未产出 Artifact"
+              echo ""
+              echo "请查看上方失败步骤的日志定位原因，或参考仓库 README 中的 FAQ 与故障排查指引。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------
+      # Step 9: 清理 Docker 缓存（尽力而为，失败不影响结果）
       # ---------------------------------------------------------------
       - name: 清理 Docker 缓存
         if: ${{ always() }}
