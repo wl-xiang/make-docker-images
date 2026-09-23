@@ -1,0 +1,22 @@
+# 构建产物 / 打包输出
+*.tgz
+*.tar
+dist/
+image-list.txt
+
+# 克隆下来的目标仓库
+target-repo/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 本地环境变量
+.env
+.env.local

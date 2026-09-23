@@ -1,0 +1,282 @@
+# =====================================================================
+# Build and Package Docker Images
+#
+# 完整链路：Git Clone 用户仓库 → 构建或拉取 Docker 镜像 → 打包 → 产出 TGZ Artifact
+#
+# 两种模式：
+#   build : 从用户仓库的 Dockerfile 构建镜像（支持跨平台，QEMU 模拟）
+#   pull  : 解析用户仓库的 Compose 文件，拉取其中定义的全部镜像
+#
+# 触发方式：workflow_dispatch（手动触发）
+# =====================================================================
+
+name: Build and Package Docker Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'GitHub 仓库克隆链接，例如 https://github.com/wl-xiang/code-server-ai.git'
+        required: true
+        type: string
+      platform:
+        description: '目标部署服务器平台'
+        required: true
+        type: choice
+        default: linux/amd64
+        options:
+          - linux/amd64
+          - linux/arm64
+      mode:
+        description: '镜像获取模式：build = 从 Dockerfile 构建，pull = 从 Compose 拉取'
+        required: true
+        type: choice
+        default: build
+        options:
+          - build
+          - pull
+      dockerfile_path:
+        description: 'Dockerfile 路径（仅 mode=build 生效）。根目录填 Dockerfile，子目录填 path/to/Dockerfile'
+        required: false
+        default: 'Dockerfile'
+        type: string
+      compose_file_path:
+        description: 'Docker Compose 文件路径（仅 mode=pull 生效）'
+        required: false
+        default: 'docker-compose.yml'
+        type: string
+      image_name:
+        description: '镜像名称与 tag（仅 mode=build 必填），例如 myimg:latest，必须带 tag'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # 克隆目标仓库的本地目录名
+  TARGET_DIR: target-repo
+  # 镜像列表文件（build/pull 两个分支共同写入，导出步骤统一消费）
+  IMAGE_LIST_FILE: image-list.txt
+
+jobs:
+  build-and-package:
+    name: Build / Pull and Package Images
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ---------------------------------------------------------------
+      # Step 1: 检出本仓库（workflow 所在仓库）
+      # ---------------------------------------------------------------
+      - name: Checkout 本仓库
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # Step 2: 校验输入参数（任何一项不通过则立即终止）
+      # ---------------------------------------------------------------
+      - name: 校验输入参数
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          MODE: ${{ inputs.mode }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
+          # -- 1. 仓库地址格式校验 --
+          if [[ ! "$REPO_URL" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(\.git)?$ ]]; then
+            fail "repo_url 不合法（当前值：$REPO_URL）。必须是形如 https://github.com/<owner>/<repo> 的 GitHub 仓库地址"
+          fi
+
+          # -- 2. 模式联动校验 --
+          if [[ "$MODE" == "build" ]]; then
+            if [[ -z "${IMAGE_NAME// /}" ]]; then
+              fail "mode=build 时 image_name 为必填项，请填写 name:tag 形式的镜像名称，例如 myimg:latest"
+            fi
+            if [[ "$IMAGE_NAME" != *:* ]]; then
+              fail "image_name 必须包含冒号 ':'（即必须显式指定 tag，格式 name:tag），当前值：$IMAGE_NAME"
+            fi
+            if [[ "$(printf '%s' "$IMAGE_NAME" | tr -cd ':' | wc -c)" -ne 1 ]]; then
+              fail "image_name 只能包含一个冒号（格式 name:tag），当前值：$IMAGE_NAME"
+            fi
+            if [[ "$IMAGE_NAME" =~ [[:space:]] ]]; then
+              fail "image_name 不能包含空白字符，当前值：$IMAGE_NAME"
+            fi
+          else
+            echo "mode=pull：image_name 将被忽略（镜像列表由 Compose 文件决定）"
+          fi
+
+          echo "✅ 输入参数校验通过（mode=$MODE）"
+
+      # ---------------------------------------------------------------
+      # Step 3: 浅克隆用户目标仓库
+      #   私有仓库支持：在本仓库 Settings → Secrets → Actions 中配置
+      #   CLONE_PAT（具有 repo 读权限的 PAT）即可，无需修改 workflow
+      # ---------------------------------------------------------------
+      - name: 克隆目标仓库
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          CLONE_PAT: ${{ secrets.CLONE_PAT }}
+        run: |
+          set -euo pipefail
+
+          CLONE_URL="$REPO_URL"
+          if [[ -n "$CLONE_PAT" ]]; then
+            # 将 https://github.com/... 替换为带 PAT 的形式（GitHub 会在日志中自动掩码令牌）
+            CLONE_URL="https://x-access-token:${CLONE_PAT}@github.com/${REPO_URL#https://github.com/}"
+            echo "已配置 CLONE_PAT，将以令牌方式克隆私有仓库"
+          fi
+
+          if ! git clone --depth 1 "$CLONE_URL" "$TARGET_DIR"; then
+            echo "::error::克隆失败：$REPO_URL"
+            echo "请依次检查："
+            echo "  1. 仓库地址是否正确、仓库是否存在"
+            echo "  2. 若为私有仓库，请在本仓库 Settings → Secrets and variables → Actions 中配置 CLONE_PAT（需 repo 读权限的 PAT）"
+            exit 1
+          fi
+          echo "✅ 目标仓库克隆成功"
+
+      # ---------------------------------------------------------------
+      # Step 4: 安装 QEMU + Buildx（跨平台构建 / 拉取的前提）
+      # ---------------------------------------------------------------
+      - name: 安装 QEMU（跨平台模拟）
+        uses: docker/setup-qemu-action@v3
+
+      - name: 安装 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ---------------------------------------------------------------
+      # Step 5A: 模式 build —— 从 Dockerfile 构建镜像
+      # ---------------------------------------------------------------
+      - name: 构建镜像（mode=build）
+        if: ${{ inputs.mode == 'build' }}
+        working-directory: target-repo
+        env:
+          DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          # Dockerfile 存在性检查（为空时使用默认值）
+          DOCKERFILE_PATH="${DOCKERFILE_PATH:-Dockerfile}"
+          if [[ ! -f "$DOCKERFILE_PATH" ]]; then
+            echo "::error::未找到 Dockerfile：$DOCKERFILE_PATH（路径相对于目标仓库根目录）"
+            exit 1
+          fi
+
+          echo "🔨 开始构建镜像 $IMAGE_NAME（平台：$PLATFORM，Dockerfile：$DOCKERFILE_PATH）"
+          if ! docker build --platform "$PLATFORM" -f "$DOCKERFILE_PATH" -t "$IMAGE_NAME" .; then
+            echo "::error::镜像构建失败，请检查 Dockerfile 内容及其依赖的网络资源是否可访问"
+            exit 1
+          fi
+
+          # 记录镜像列表，供导出步骤统一消费
+          echo "$IMAGE_NAME" > "$GITHUB_WORKSPACE/$IMAGE_LIST_FILE"
+          echo "✅ 镜像构建完成：$IMAGE_NAME"
+
+      # ---------------------------------------------------------------
+      # Step 5B: 模式 pull —— 从 Compose 文件拉取全部镜像
+      #   说明：不真正启动服务，而是解析 Compose 文件中的镜像列表，
+      #   逐个以 --platform 强制拉取目标架构，避免拉到 Runner 默认架构
+      # ---------------------------------------------------------------
+      - name: 拉取 Compose 镜像（mode=pull）
+        if: ${{ inputs.mode == 'pull' }}
+        working-directory: target-repo
+        env:
+          COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          # Compose 文件存在性检查（为空时使用默认值）
+          COMPOSE_FILE_PATH="${COMPOSE_FILE_PATH:-docker-compose.yml}"
+          if [[ ! -f "$COMPOSE_FILE_PATH" ]]; then
+            echo "::error::未找到 Compose 文件：$COMPOSE_FILE_PATH（路径相对于目标仓库根目录）"
+            exit 1
+          fi
+
+          # 解析 Compose 文件中定义的全部镜像
+          if ! IMAGES=$(docker compose -f "$COMPOSE_FILE_PATH" config --images 2>/dev/null | sort -u); then
+            echo "::error::解析 Compose 文件失败：$COMPOSE_FILE_PATH。请确认文件格式正确、必需的环境变量已定义"
+            exit 1
+          fi
+          if [[ -z "$IMAGES" ]]; then
+            echo "::error::Compose 文件中未解析到任何镜像，请检查 services.*.image 配置"
+            exit 1
+          fi
+
+          echo "📦 将拉取以下镜像（平台：$PLATFORM）："
+          printf '  - %s\n' $IMAGES
+
+          # 逐个强制拉取目标平台架构
+          while IFS= read -r img; do
+            if ! docker pull --platform "$PLATFORM" "$img"; then
+              echo "::error::拉取镜像失败：$img（平台：$PLATFORM）。请确认该镜像存在且支持目标架构"
+              exit 1
+            fi
+          done <<< "$IMAGES"
+
+          # 记录镜像列表，供导出步骤统一消费
+          echo "$IMAGES" > "$GITHUB_WORKSPACE/$IMAGE_LIST_FILE"
+          echo "✅ 全部镜像拉取完成"
+
+      # ---------------------------------------------------------------
+      # Step 6: docker save 导出全部镜像，并压缩为 TGZ
+      #   命名规范：images-<platform>-<mode>-<run_number>.tgz
+      # ---------------------------------------------------------------
+      - name: 导出镜像并压缩为 TGZ
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          MODE: ${{ inputs.mode }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+
+          # linux/amd64 -> linux-amd64（文件名中不能包含 /）
+          PLATFORM_TAG="${PLATFORM//\//-}"
+          TGZ_NAME="images-${PLATFORM_TAG}-${MODE}-${RUN_NUMBER}.tgz"
+
+          if [[ ! -f "$IMAGE_LIST_FILE" ]]; then
+            echo "::error::未找到镜像列表文件 $IMAGE_LIST_FILE，前置步骤可能未执行"
+            exit 1
+          fi
+
+          mkdir -p dist
+          mapfile -t IMAGES < "$IMAGE_LIST_FILE"
+
+          echo "📤 导出以下 ${#IMAGES[@]} 个镜像："
+          printf '  - %s\n' "${IMAGES[@]}"
+
+          if ! docker save "${IMAGES[@]}" | gzip > "dist/$TGZ_NAME"; then
+            echo "::error::docker save / 压缩失败"
+            exit 1
+          fi
+
+          echo "TGZ_NAME=$TGZ_NAME" >> "$GITHUB_ENV"
+          echo "✅ 打包完成：dist/$TGZ_NAME"
+          ls -lh dist/
+
+      # ---------------------------------------------------------------
+      # Step 7: 上传 TGZ Artifact（每次运行的产物通过 run_number 区分，互不覆盖）
+      # ---------------------------------------------------------------
+      - name: 上传 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TGZ_NAME }}
+          path: dist/${{ env.TGZ_NAME }}
+          retention-days: 14
+          if-no-files-found: error
+
+      # ---------------------------------------------------------------
+      # Step 8: 清理 Docker 缓存（尽力而为，失败不影响结果）
+      # ---------------------------------------------------------------
+      - name: 清理 Docker 缓存
+        if: ${{ always() }}
+        continue-on-error: true
+        run: docker system prune -f
