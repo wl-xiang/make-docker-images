@@ -8,6 +8,12 @@
 #   pull  : 解析用户仓库的 Compose 文件，拉取其中定义的全部镜像
 #
 # 触发方式：workflow_dispatch（手动触发）
+#
+# 可选 Secrets：
+#   CLONE_PAT          克隆私有 Git 仓库用的 PAT（repo 读权限）
+#   REGISTRY_SERVER    私有镜像仓库地址（如 ghcr.io / registry.example.com:5000，默认 docker.io）
+#   REGISTRY_USERNAME  私有镜像仓库用户名
+#   REGISTRY_PASSWORD  私有镜像仓库密码/令牌
 # =====================================================================
 
 name: Build and Package Docker Images
@@ -79,7 +85,10 @@ jobs:
       - name: 校验输入参数
         env:
           REPO_URL: ${{ inputs.repo_url }}
+          PLATFORM: ${{ inputs.platform }}
           MODE: ${{ inputs.mode }}
+          DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
+          COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
           IMAGE_NAME: ${{ inputs.image_name }}
         run: |
           set -euo pipefail
@@ -88,12 +97,19 @@ jobs:
             exit 1
           }
 
-          # -- 1. 仓库地址格式校验 --
-          if [[ ! "$REPO_URL" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(\.git)?$ ]]; then
+          # -- 1. 仓库地址格式校验（允许可选的 .git 后缀与结尾斜杠）--
+          if [[ ! "$REPO_URL" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(\.git)?/?$ ]]; then
             fail "repo_url 不合法（当前值：$REPO_URL）。必须是形如 https://github.com/<owner>/<repo> 的 GitHub 仓库地址"
           fi
 
-          # -- 2. 模式联动校验 --
+          # -- 2. 路径参数校验（必须为相对路径，且不得包含 ..）--
+          for p in "$DOCKERFILE_PATH" "$COMPOSE_FILE_PATH"; do
+            [[ -z "$p" ]] && continue
+            [[ "$p" == /* ]] && fail "路径参数必须为相对路径（相对目标仓库根目录）：$p"
+            [[ "$p" == *..* ]] && fail "路径参数不得包含 '..'：$p"
+          done
+
+          # -- 3. 模式联动校验 --
           if [[ "$MODE" == "build" ]]; then
             if [[ -z "${IMAGE_NAME// /}" ]]; then
               fail "mode=build 时 image_name 为必填项，请填写 name:tag 形式的镜像名称，例如 myimg:latest"
@@ -101,27 +117,41 @@ jobs:
             if [[ "$IMAGE_NAME" != *:* ]]; then
               fail "image_name 必须包含冒号 ':'（即必须显式指定 tag，格式 name:tag），当前值：$IMAGE_NAME"
             fi
-            if [[ "$(printf '%s' "$IMAGE_NAME" | tr -cd ':' | wc -c)" -ne 1 ]]; then
-              fail "image_name 只能包含一个冒号（格式 name:tag），当前值：$IMAGE_NAME"
+            # 按最后一个冒号拆分（兼容 registry.example.com:5000/name 形式的镜像名）
+            NAME_PART="${IMAGE_NAME%:*}"
+            TAG_PART="${IMAGE_NAME##*:}"
+            if [[ -z "$NAME_PART" ]]; then
+              fail "image_name 的名称部分不能为空，当前值：$IMAGE_NAME"
+            fi
+            if [[ -z "$TAG_PART" ]]; then
+              fail "image_name 的 tag 部分不能为空（必须显式指定 tag），当前值：$IMAGE_NAME"
+            fi
+            if [[ "$TAG_PART" == */* ]]; then
+              fail "image_name 格式不正确（tag 部分不能包含 '/'），当前值：$IMAGE_NAME"
             fi
             if [[ "$IMAGE_NAME" =~ [[:space:]] ]]; then
               fail "image_name 不能包含空白字符，当前值：$IMAGE_NAME"
+            fi
+            if [[ "$NAME_PART" =~ [A-Z] ]]; then
+              fail "image_name 的名称部分必须全小写（Docker 镜像名规范），当前值：$IMAGE_NAME"
             fi
           else
             echo "mode=pull：image_name 将被忽略（镜像列表由 Compose 文件决定）"
           fi
 
-          echo "✅ 输入参数校验通过（mode=$MODE）"
+          echo "✅ 输入参数校验通过（mode=$MODE，platform=$PLATFORM）"
 
       # ---------------------------------------------------------------
       # Step 3: 浅克隆用户目标仓库
       #   私有仓库支持：在本仓库 Settings → Secrets → Actions 中配置
       #   CLONE_PAT（具有 repo 读权限的 PAT）即可，无需修改 workflow
+      #   GIT_TERMINAL_PROMPT=0：凭据缺失时快速失败，避免挂起等待输入
       # ---------------------------------------------------------------
       - name: 克隆目标仓库
         env:
           REPO_URL: ${{ inputs.repo_url }}
           CLONE_PAT: ${{ secrets.CLONE_PAT }}
+          GIT_TERMINAL_PROMPT: '0'
         run: |
           set -euo pipefail
 
@@ -143,6 +173,8 @@ jobs:
 
       # ---------------------------------------------------------------
       # Step 4: 安装 QEMU + Buildx（跨平台构建 / 拉取的前提）
+      #   QEMU：在 x86 Runner 上模拟 arm64 执行 Dockerfile 中的 RUN 指令
+      #   Buildx：docker-container 驱动构建器，支持 --platform 跨平台构建
       # ---------------------------------------------------------------
       - name: 安装 QEMU（跨平台模拟）
         uses: docker/setup-qemu-action@v3
@@ -151,7 +183,30 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       # ---------------------------------------------------------------
-      # Step 5A: 模式 build —— 从 Dockerfile 构建镜像
+      # Step 5: 登录私有镜像仓库（可选）
+      #   配置了 REGISTRY_USERNAME / REGISTRY_PASSWORD secrets 时自动生效，
+      #   用于 build 模式拉取私有基础镜像、pull 模式拉取私有业务镜像
+      # ---------------------------------------------------------------
+      - name: 登录镜像仓库（可选）
+        env:
+          REGISTRY_SERVER: ${{ secrets.REGISTRY_SERVER }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${REGISTRY_USERNAME:-}" || -z "${REGISTRY_PASSWORD:-}" ]]; then
+            echo "未配置 REGISTRY_USERNAME / REGISTRY_PASSWORD secrets，跳过镜像仓库登录（仅可访问公开镜像）"
+            exit 0
+          fi
+          SERVER="${REGISTRY_SERVER:-docker.io}"
+          echo "🔐 登录镜像仓库：$SERVER"
+          echo "$REGISTRY_PASSWORD" | docker login "$SERVER" --username "$REGISTRY_USERNAME" --password-stdin
+          echo "REGISTRY_LOGGED_IN=1" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # Step 6A: 模式 build —— 从 Dockerfile 构建镜像
+      #   注意：setup-buildx 之后默认构建器为 docker-container 驱动，
+      #   构建结果不会自动进入本地镜像库，必须显式 --load 才能 docker save
       # ---------------------------------------------------------------
       - name: 构建镜像（mode=build）
         if: ${{ inputs.mode == 'build' }}
@@ -171,8 +226,14 @@ jobs:
           fi
 
           echo "🔨 开始构建镜像 $IMAGE_NAME（平台：$PLATFORM，Dockerfile：$DOCKERFILE_PATH）"
-          if ! docker build --platform "$PLATFORM" -f "$DOCKERFILE_PATH" -t "$IMAGE_NAME" .; then
+          if ! docker buildx build --platform "$PLATFORM" --load -f "$DOCKERFILE_PATH" -t "$IMAGE_NAME" .; then
             echo "::error::镜像构建失败，请检查 Dockerfile 内容及其依赖的网络资源是否可访问"
+            exit 1
+          fi
+
+          # 确认镜像确实已进入本地镜像库（防止 --load 未生效等边缘情况）
+          if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+            echo "::error::镜像构建完成但未在本地镜像库中找到：$IMAGE_NAME"
             exit 1
           fi
 
@@ -181,9 +242,9 @@ jobs:
           echo "✅ 镜像构建完成：$IMAGE_NAME"
 
       # ---------------------------------------------------------------
-      # Step 5B: 模式 pull —— 从 Compose 文件拉取全部镜像
-      #   说明：不真正启动服务，而是解析 Compose 文件中的镜像列表，
-      #   逐个以 --platform 强制拉取目标架构，避免拉到 Runner 默认架构
+      # Step 6B: 模式 pull —— 从 Compose 文件拉取全部镜像
+      #   不启动任何容器：先解析 Compose 得到镜像清单，
+      #   再逐个以 --platform 强制拉取目标架构，避免拉到 Runner 默认架构
       # ---------------------------------------------------------------
       - name: 拉取 Compose 镜像（mode=pull）
         if: ${{ inputs.mode == 'pull' }}
@@ -201,9 +262,25 @@ jobs:
             exit 1
           fi
 
+          # 解析 Compose 文件（格式错误、引用了未定义的环境变量等会在这里失败）
+          if ! CONFIG_JSON=$(docker compose -f "$COMPOSE_FILE_PATH" config --format json 2>/dev/null); then
+            echo "::error::解析 Compose 文件失败：$COMPOSE_FILE_PATH。请确认文件格式正确、引用的环境变量已有定义或默认值"
+            exit 1
+          fi
+
+          # 检测 build 型服务（声明了 build: 字段）：pull 模式只负责拉取，不执行构建
+          BUILD_SVCS=$(jq -r '.services | to_entries[] | select(.value.build != null) | .key' <<<"$CONFIG_JSON" | grep -v '^$' || true)
+          if [[ -n "$BUILD_SVCS" ]]; then
+            echo "::error::Compose 文件中存在 build 型服务（声明了 build: 字段）：$(echo "$BUILD_SVCS" | xargs)"
+            echo "pull 模式只负责拉取镜像，不执行构建。请任选其一："
+            echo "  1. 在目标仓库中为这些服务补充 image: 字段（指向 registry 中已存在的镜像）"
+            echo "  2. 改用 build 模式（单一 Dockerfile）"
+            exit 1
+          fi
+
           # 解析 Compose 文件中定义的全部镜像
           if ! IMAGES=$(docker compose -f "$COMPOSE_FILE_PATH" config --images 2>/dev/null | sort -u); then
-            echo "::error::解析 Compose 文件失败：$COMPOSE_FILE_PATH。请确认文件格式正确、必需的环境变量已定义"
+            echo "::error::获取镜像清单失败：$COMPOSE_FILE_PATH"
             exit 1
           fi
           if [[ -z "$IMAGES" ]]; then
@@ -216,8 +293,10 @@ jobs:
 
           # 逐个强制拉取目标平台架构
           while IFS= read -r img; do
+            [[ -z "$img" ]] && continue
             if ! docker pull --platform "$PLATFORM" "$img"; then
-              echo "::error::拉取镜像失败：$img（平台：$PLATFORM）。请确认该镜像存在且支持目标架构"
+              echo "::error::拉取镜像失败：$img（平台：$PLATFORM）"
+              echo "可能原因：镜像名拼写错误 / 镜像不存在 / 该镜像不支持目标架构 / 私有镜像仓库未配置登录（见 README「私有镜像仓库支持」）"
               exit 1
             fi
           done <<< "$IMAGES"
@@ -227,8 +306,52 @@ jobs:
           echo "✅ 全部镜像拉取完成"
 
       # ---------------------------------------------------------------
-      # Step 6: docker save 导出全部镜像，并压缩为 TGZ
-      #   命名规范：images-<platform>-<mode>-<run_number>.tgz
+      # Step 7: 验证镜像架构
+      #   逐一检查本地镜像的 Os/Architecture 是否与目标平台一致，
+      #   防止拉错/构建错架构的镜像被打进离线包（元数据为 unknown 的
+      #   老镜像跳过强校验，仅告警）
+      # ---------------------------------------------------------------
+      - name: 验证镜像架构
+        env:
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! -s "$IMAGE_LIST_FILE" ]]; then
+            echo "::error::未找到镜像列表文件 $IMAGE_LIST_FILE，前置步骤可能未执行"
+            exit 1
+          fi
+
+          PLATFORM_OS="${PLATFORM%%/*}"
+          PLATFORM_ARCH="${PLATFORM##*/}"
+          MISMATCH=0
+
+          while IFS= read -r img; do
+            [[ -z "$img" ]] && continue
+            actual=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$img" 2>/dev/null) || {
+              echo "::error::镜像在本地镜像库中不存在：$img"
+              exit 1
+            }
+            if [[ "$actual" == "$PLATFORM_OS/$PLATFORM_ARCH" ]]; then
+              echo "✅ $img → $actual"
+            elif [[ "$actual" == *"/unknown" || "$actual" == "unknown/unknown" ]]; then
+              echo "⚠️ $img 架构元数据为 $actual（常见于较老的镜像），跳过强校验"
+            else
+              echo "::error::镜像 $img 的架构为 $actual，与目标平台 $PLATFORM 不符"
+              MISMATCH=1
+            fi
+          done < "$IMAGE_LIST_FILE"
+
+          if [[ "$MISMATCH" -ne 0 ]]; then
+            echo "::error::存在架构不匹配的镜像，已终止打包。请检查镜像是否支持目标平台"
+            exit 1
+          fi
+          echo "✅ 全部镜像架构校验通过"
+
+      # ---------------------------------------------------------------
+      # Step 8: docker save 导出全部镜像，并压缩为 TGZ
+      #   文件命名：images-<platform>-<mode>-<run_number>.tgz
+      #   Artifact 命名：images-<platform>-<mode>-<run_number>（不含扩展名）
       # ---------------------------------------------------------------
       - name: 导出镜像并压缩为 TGZ
         env:
@@ -240,15 +363,21 @@ jobs:
 
           # linux/amd64 -> linux-amd64（文件名中不能包含 /）
           PLATFORM_TAG="${PLATFORM//\//-}"
-          TGZ_NAME="images-${PLATFORM_TAG}-${MODE}-${RUN_NUMBER}.tgz"
+          ARTIFACT_NAME="images-${PLATFORM_TAG}-${MODE}-${RUN_NUMBER}"
+          TGZ_NAME="${ARTIFACT_NAME}.tgz"
 
-          if [[ ! -f "$IMAGE_LIST_FILE" ]]; then
+          if [[ ! -s "$IMAGE_LIST_FILE" ]]; then
             echo "::error::未找到镜像列表文件 $IMAGE_LIST_FILE，前置步骤可能未执行"
             exit 1
           fi
 
           mkdir -p dist
-          mapfile -t IMAGES < "$IMAGE_LIST_FILE"
+          mapfile -t IMAGES < <(grep -v '^[[:space:]]*$' "$IMAGE_LIST_FILE" || true)
+
+          if [[ ${#IMAGES[@]} -eq 0 ]]; then
+            echo "::error::镜像列表为空，无法导出"
+            exit 1
+          fi
 
           echo "📤 导出以下 ${#IMAGES[@]} 个镜像："
           printf '  - %s\n' "${IMAGES[@]}"
@@ -258,23 +387,41 @@ jobs:
             exit 1
           fi
 
-          echo "TGZ_NAME=$TGZ_NAME" >> "$GITHUB_ENV"
-          echo "✅ 打包完成：dist/$TGZ_NAME"
+          if [[ ! -s "dist/$TGZ_NAME" ]]; then
+            echo "::error::TGZ 产物为空文件：dist/$TGZ_NAME"
+            exit 1
+          fi
+
+          TGZ_SHA256=$(sha256sum "dist/$TGZ_NAME" | awk '{print $1}')
+          TGZ_SIZE=$(du -h "dist/$TGZ_NAME" | cut -f1)
+
+          {
+            echo "ARTIFACT_NAME=$ARTIFACT_NAME"
+            echo "TGZ_NAME=$TGZ_NAME"
+            echo "TGZ_SHA256=$TGZ_SHA256"
+            echo "TGZ_SIZE=$TGZ_SIZE"
+          } >> "$GITHUB_ENV"
+
+          echo "✅ 打包完成：dist/$TGZ_NAME（${TGZ_SIZE}，SHA256：${TGZ_SHA256}）"
           ls -lh dist/
 
       # ---------------------------------------------------------------
-      # Step 7: 上传 TGZ Artifact（每次运行的产物通过 run_number 区分，互不覆盖）
+      # Step 9: 上传 TGZ Artifact
+      #   每次运行的产物通过 run_number 区分，互不覆盖
+      #   注：Artifact 下载后为 zip 包，解压即得到 TGZ 文件
       # ---------------------------------------------------------------
       - name: 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.TGZ_NAME }}
+          name: ${{ env.ARTIFACT_NAME }}
           path: dist/${{ env.TGZ_NAME }}
           retention-days: 14
           if-no-files-found: error
 
       # ---------------------------------------------------------------
-      # Step 8: 输出运行摘要（显示在运行页面底部的 Summary 区域）
+      # Step 10: 输出运行摘要（显示在运行页面底部的 Summary 区域）
+      #   包含：配置参数、产物文件名/大小/SHA256、镜像清单（架构+大小）、
+      #   目标服务器导入方法；失败时给出排查指引
       # ---------------------------------------------------------------
       - name: 输出运行摘要
         if: ${{ always() }}
@@ -288,6 +435,23 @@ jobs:
           RUN_NUMBER: ${{ github.run_number }}
           JOB_STATUS: ${{ job.status }}
         run: |
+          set -euo pipefail
+
+          # 取镜像大小（人类可读），镜像已不存在时返回 "-"
+          img_size() {
+            local bytes
+            if bytes=$(docker image inspect --format '{{.Size}}' "$1" 2>/dev/null); then
+              numfmt --to=iec --suffix=B "$bytes" 2>/dev/null || echo "${bytes}B"
+            else
+              echo "-"
+            fi
+          }
+
+          # 取镜像架构，镜像已不存在时返回 "-"
+          img_arch() {
+            docker image inspect --format '{{.Os}}/{{.Architecture}}' "$1" 2>/dev/null || echo "-"
+          }
+
           {
             echo "## 📦 镜像构建打包摘要"
             echo ""
@@ -306,36 +470,68 @@ jobs:
             echo "| 运行状态 | \`${JOB_STATUS}\` |"
             echo ""
 
-            if [[ "$JOB_STATUS" == "success" && -f "$IMAGE_LIST_FILE" && -n "${TGZ_NAME:-}" ]]; then
-              mapfile -t IMAGES < "$IMAGE_LIST_FILE"
-              TGZ_PATH="dist/$TGZ_NAME"
-              TGZ_SIZE=$(du -h "$TGZ_PATH" | cut -f1)
+            if [[ "$JOB_STATUS" == "success" && -n "${TGZ_NAME:-}" && -f "dist/$TGZ_NAME" ]]; then
               echo "### ✅ 产出 Artifact"
               echo ""
-              echo "| 文件名 | 大小 | 包含镜像数 |"
-              echo "|---|---|---|"
-            echo "| \`${TGZ_NAME}\` | ${TGZ_SIZE} | ${#IMAGES[@]} |"
-              echo ""
-              echo "### 镜像清单"
-              echo ""
-              for img in "${IMAGES[@]}"; do
-                echo "- \`${img}\`"
-              done
+              echo "| 项目 | 值 |"
+              echo "|---|---|"
+              echo "| Artifact 名称 | \`${ARTIFACT_NAME}\` |"
+              echo "| 文件名 | \`${TGZ_NAME}\` |"
+              echo "| 大小 | ${TGZ_SIZE:-?} |"
+              echo "| SHA256 | \`${TGZ_SHA256:-?}\` |"
+
+              if [[ -f "$IMAGE_LIST_FILE" ]]; then
+                mapfile -t IMAGES < <(grep -v '^[[:space:]]*$' "$IMAGE_LIST_FILE" || true)
+                echo "| 包含镜像数 | ${#IMAGES[@]} |"
+                echo ""
+                echo "### 镜像清单"
+                echo ""
+                echo "| 镜像 | 架构 | 大小 |"
+                echo "|---|---|---|"
+                for img in "${IMAGES[@]}"; do
+                  echo "| \`${img}\` | $(img_arch "$img") | $(img_size "$img") |"
+                done
+              fi
               echo ""
               echo "### 目标服务器导入方法"
               echo ""
+              echo "从本次运行页面的 **Artifacts** 区域下载 \`${ARTIFACT_NAME}\`（下载得到 zip，解压即为本 TGZ 文件）："
+              echo ""
               echo '```bash'
+              echo "# 1. 校验完整性（可选，SHA256 见上表）"
+              echo "echo \"${TGZ_SHA256:-<sha256>}  ${TGZ_NAME}\" | sha256sum -c"
+              echo ""
+              echo "# 2. 导入全部镜像"
               echo "docker load -i <(gunzip -c ${TGZ_NAME})"
+              echo ""
+              echo "# 3. 验证导入结果"
+              echo "docker images"
               echo '```'
             else
               echo "### ⚠️ 本次运行未产出 Artifact"
               echo ""
-              echo "请查看上方失败步骤的日志定位原因，或参考仓库 README 中的 FAQ 与故障排查指引。"
+              echo "运行状态：\`${JOB_STATUS}\`。请查看上方失败步骤的日志定位原因，常见问题："
+              echo ""
+              echo "- 参数校验失败 → 检查 repo_url 地址格式、image_name 是否为 name:tag 形式"
+              echo "- 克隆失败 → 检查仓库地址；私有仓库需配置 \`CLONE_PAT\` secret"
+              echo "- 构建失败 → 检查 Dockerfile 及其依赖的网络资源；arm64 构建较慢属正常现象"
+              echo "- 拉取失败 → 检查镜像名拼写、目标架构支持；私有镜像仓库需配置登录 secrets"
+              echo ""
+              echo "更多排查指引见仓库 README 的 **FAQ 与故障排查** 章节。"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       # ---------------------------------------------------------------
-      # Step 9: 清理 Docker 缓存（尽力而为，失败不影响结果）
+      # Step 11: 登出镜像仓库（若曾登录，尽力而为）
+      # ---------------------------------------------------------------
+      - name: 登出镜像仓库
+        if: ${{ always() && env.REGISTRY_LOGGED_IN == '1' }}
+        continue-on-error: true
+        run: docker logout || true
+
+      # ---------------------------------------------------------------
+      # Step 12: 清理 Docker 缓存（尽力而为，失败不影响结果）
+      #   注意：带 tag 的镜像不会被删除，仅清理构建缓存/悬空层
       # ---------------------------------------------------------------
       - name: 清理 Docker 缓存
         if: ${{ always() }}
