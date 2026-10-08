@@ -57,7 +57,7 @@ on:
         default: ''
         type: string
       image_name:
-        description: '镜像名称与 tag（仅 mode=build 必填），例如 myimg:latest，必须带 tag'
+        description: '镜像名称与 tag（仅 mode=build 生效），例如 myimg:latest。留空则默认使用 <repo_name>:latest（repo_name 取自 repo_url 的项目名）'
         required: false
         default: ''
         type: string
@@ -118,28 +118,30 @@ jobs:
           # -- 3. 模式联动校验 --
           if [[ "$MODE" == "build" ]]; then
             if [[ -z "${IMAGE_NAME// /}" ]]; then
-              fail "mode=build 时 image_name 为必填项，请填写 name:tag 形式的镜像名称，例如 myimg:latest"
-            fi
-            if [[ "$IMAGE_NAME" != *:* ]]; then
-              fail "image_name 必须包含冒号 ':'（即必须显式指定 tag，格式 name:tag），当前值：$IMAGE_NAME"
-            fi
-            # 按最后一个冒号拆分（兼容 registry.example.com:5000/name 形式的镜像名）
-            NAME_PART="${IMAGE_NAME%:*}"
-            TAG_PART="${IMAGE_NAME##*:}"
-            if [[ -z "$NAME_PART" ]]; then
-              fail "image_name 的名称部分不能为空，当前值：$IMAGE_NAME"
-            fi
-            if [[ -z "$TAG_PART" ]]; then
-              fail "image_name 的 tag 部分不能为空（必须显式指定 tag），当前值：$IMAGE_NAME"
-            fi
-            if [[ "$TAG_PART" == */* ]]; then
-              fail "image_name 格式不正确（tag 部分不能包含 '/'），当前值：$IMAGE_NAME"
-            fi
-            if [[ "$IMAGE_NAME" =~ [[:space:]] ]]; then
-              fail "image_name 不能包含空白字符，当前值：$IMAGE_NAME"
-            fi
-            if [[ "$NAME_PART" =~ [A-Z] ]]; then
-              fail "image_name 的名称部分必须全小写（Docker 镜像名规范），当前值：$IMAGE_NAME"
+              # 留空时构建阶段将默认使用 <repo_name>:latest，此处跳过格式校验
+              echo "mode=build：未填写 image_name，构建时将默认使用 <repo_name>:latest"
+            else
+              if [[ "$IMAGE_NAME" != *:* ]]; then
+                fail "image_name 必须包含冒号 ':'（即必须显式指定 tag，格式 name:tag），当前值：$IMAGE_NAME"
+              fi
+              # 按最后一个冒号拆分（兼容 registry.example.com:5000/name 形式的镜像名）
+              NAME_PART="${IMAGE_NAME%:*}"
+              TAG_PART="${IMAGE_NAME##*:}"
+              if [[ -z "$NAME_PART" ]]; then
+                fail "image_name 的名称部分不能为空，当前值：$IMAGE_NAME"
+              fi
+              if [[ -z "$TAG_PART" ]]; then
+                fail "image_name 的 tag 部分不能为空（必须显式指定 tag），当前值：$IMAGE_NAME"
+              fi
+              if [[ "$TAG_PART" == */* ]]; then
+                fail "image_name 格式不正确（tag 部分不能包含 '/'），当前值：$IMAGE_NAME"
+              fi
+              if [[ "$IMAGE_NAME" =~ [[:space:]] ]]; then
+                fail "image_name 不能包含空白字符，当前值：$IMAGE_NAME"
+              fi
+              if [[ "$NAME_PART" =~ [A-Z] ]]; then
+                fail "image_name 的名称部分必须全小写（Docker 镜像名规范），当前值：$IMAGE_NAME"
+              fi
             fi
           else
             echo "mode=pull：image_name 将被忽略（镜像列表由 Compose 文件决定）"
@@ -252,11 +254,27 @@ jobs:
         if: ${{ inputs.mode == 'build' }}
         working-directory: target-repo
         env:
+          REPO_URL: ${{ inputs.repo_url }}
           DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
           IMAGE_NAME: ${{ inputs.image_name }}
           PLATFORM: ${{ inputs.platform }}
         run: |
           set -euo pipefail
+
+          # image_name 留空时，默认使用 <repo_name>:latest（repo_name 取自 repo_url 的项目名）
+          if [[ -z "${IMAGE_NAME// /}" ]]; then
+            REPO_NAME="${REPO_URL%/}"
+            REPO_NAME="${REPO_NAME%.git}"
+            REPO_NAME="${REPO_NAME##*/}"
+            REPO_NAME="${REPO_NAME,,}"
+            if [[ -z "$REPO_NAME" ]]; then
+              echo "::error::image_name 留空且无法从 repo_url 解析出项目名：$REPO_URL"
+              exit 1
+            fi
+            IMAGE_NAME="${REPO_NAME}:latest"
+            echo "ℹ️ 未填写 image_name，已使用默认值：$IMAGE_NAME"
+          fi
+          echo "IMAGE_NAME=$IMAGE_NAME" >> "$GITHUB_ENV"
 
           # Dockerfile 存在性检查（为空时使用默认值）
           DOCKERFILE_PATH="${DOCKERFILE_PATH:-Dockerfile}"
@@ -484,11 +502,14 @@ jobs:
           MODE: ${{ inputs.mode }}
           DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
           COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
-          IMAGE_NAME: ${{ inputs.image_name }}
+          INPUT_IMAGE_NAME: ${{ inputs.image_name }}
           RUN_NUMBER: ${{ github.run_number }}
           JOB_STATUS: ${{ job.status }}
         run: |
           set -euo pipefail
+
+          # 优先使用构建阶段解析出的镜像名（含默认值），否则回退到原始输入
+          IMAGE_NAME="${IMAGE_NAME:-$INPUT_IMAGE_NAME}"
 
           # 取镜像大小（人类可读），镜像已不存在时返回 "-"
           img_size() {
