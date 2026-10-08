@@ -350,20 +350,33 @@ jobs:
 
       # ---------------------------------------------------------------
       # Step 8: docker save 导出全部镜像，并压缩为 TGZ
-      #   文件命名：images-<platform>-<mode>-<run_number>.tgz
-      #   Artifact 命名：images-<platform>-<mode>-<run_number>（不含扩展名）
+      #   文件名：<repo-name>_docker-images_<platform>_<mode>_<yyyymmdd-HHMMSS>.tgz
+      #   Artifact 命名：与文件名同基名（不含 .tgz 扩展名）
+      #   repo-name 取自 repo_url 的项目名；时间戳使用 Asia/Shanghai 时区
       # ---------------------------------------------------------------
       - name: 导出镜像并压缩为 TGZ
         env:
+          REPO_URL: ${{ inputs.repo_url }}
           PLATFORM: ${{ inputs.platform }}
           MODE: ${{ inputs.mode }}
-          RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
 
+          # 从 repo_url 提取项目名：去掉可选结尾斜杠与 .git 后缀，取最后一段路径
+          REPO_NAME="${REPO_URL%/}"
+          REPO_NAME="${REPO_NAME%.git}"
+          REPO_NAME="${REPO_NAME##*/}"
+          if [[ -z "$REPO_NAME" ]]; then
+            echo "::error::无法从 repo_url 解析出项目名：$REPO_URL"
+            exit 1
+          fi
+
           # linux/amd64 -> linux-amd64（文件名中不能包含 /）
           PLATFORM_TAG="${PLATFORM//\//-}"
-          ARTIFACT_NAME="images-${PLATFORM_TAG}-${MODE}-${RUN_NUMBER}"
+          # 北京时间戳，形如 20261009-153045
+          TIMESTAMP="$(TZ='Asia/Shanghai' date +%Y%m%d-%H%M%S)"
+
+          ARTIFACT_NAME="${REPO_NAME}_docker-images_${PLATFORM_TAG}_${MODE}_${TIMESTAMP}"
           TGZ_NAME="${ARTIFACT_NAME}.tgz"
 
           if [[ ! -s "$IMAGE_LIST_FILE" ]]; then
@@ -407,7 +420,7 @@ jobs:
 
       # ---------------------------------------------------------------
       # Step 9: 上传 TGZ Artifact
-      #   每次运行的产物通过 run_number 区分，互不覆盖
+      #   每次运行的产物通过时间戳区分，互不覆盖
       #   注：Artifact 下载后为 zip 包，解压即得到 TGZ 文件
       # ---------------------------------------------------------------
       - name: 上传 Artifact

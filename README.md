@@ -25,7 +25,7 @@
 └─────────────────────┘
           │
           ▼
-  images-<platform>-<mode>-<run_number>.tgz（可下载，离线部署用）
+  <repo-name>_docker-images_<platform>_<mode>_<yyyymmdd-HHMMSS>.tgz（可下载，离线部署用）
 ```
 
 ## 使用方法
@@ -109,30 +109,33 @@ workflow 会：
 每次运行产出**一个 TGZ 文件**，命名规范：
 
 ```
-images-<platform>-<mode>-<run_number>.tgz
-例如：images-linux-amd64-build-13.tgz
+<repo-name>_docker-images_<platform>_<mode>_<yyyymmdd-HHMMSS>.tgz
+例如：code-server-ai_docker-images_linux-amd64_build_20261009-153045.tgz
 ```
 
+- `<repo-name>`：取自 `repo_url` 的项目名（如 `https://github.com/wl-xiang/code-server-ai.git` → `code-server-ai`）
+- `<platform>`：目标平台，`/` 替换为 `-`（如 `linux/amd64` → `linux-amd64`）
+- `<yyyymmdd-HHMMSS>`：打包时的北京时间戳
 - `build` 模式：包含 1 个镜像
 - `pull` 模式：包含 Compose 文件中的全部镜像
-- Artifact 保留 14 天；不同运行通过 run_number 区分，互不覆盖
+- Artifact 保留 14 天；不同运行通过时间戳区分，互不覆盖
 - 打包后会自动**校验每个镜像的架构**与目标平台一致，防止拉错/构建错架构的镜像混入离线包
 - Summary 中会记录 TGZ 的 **SHA256** 哈希，供传输后校验完整性
 
 ### 下载后在目标服务器导入
 
-从 run 页面 **Artifacts** 区域下载（例如 `images-linux-amd64-build-13`，下载得到的是 zip，**解压后即为 TGZ 文件**）：
+从 run 页面 **Artifacts** 区域下载（例如 `code-server-ai_docker-images_linux-amd64_build_20261009-153045`，下载得到的是 zip，**解压后即为 TGZ 文件**）：
 
 ```bash
 # 0. 校验完整性（可选，SHA256 值见 run 页面的 Summary）
-echo "<summary 中的 sha256>  images-linux-amd64-build-13.tgz" | sha256sum -c
+echo "<summary 中的 sha256>  code-server-ai_docker-images_linux-amd64_build_20261009-153045.tgz" | sha256sum -c
 
 # 方式一：gunzip 后导入
-gunzip images-linux-amd64-build-13.tgz
-docker load -i images-linux-amd64-build-13.tar
+gunzip code-server-ai_docker-images_linux-amd64_build_20261009-153045.tgz
+docker load -i code-server-ai_docker-images_linux-amd64_build_20261009-153045.tar
 
 # 方式二：一步到位（推荐）
-docker load -i <(gunzip -c images-linux-amd64-build-13.tgz)
+docker load -i <(gunzip -c code-server-ai_docker-images_linux-amd64_build_20261009-153045.tgz)
 
 # 验证镜像已导入
 docker images
