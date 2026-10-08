@@ -51,6 +51,11 @@ on:
         required: false
         default: 'docker-compose.yml'
         type: string
+      env_file_dir:
+        description: '环境变量文件（.env / .env.example）所在目录（相对目标仓库根目录），留空表示项目根目录'
+        required: false
+        default: ''
+        type: string
       image_name:
         description: '镜像名称与 tag（仅 mode=build 必填），例如 myimg:latest，必须带 tag'
         required: false
@@ -89,6 +94,7 @@ jobs:
           MODE: ${{ inputs.mode }}
           DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
           COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
+          ENV_FILE_DIR: ${{ inputs.env_file_dir }}
           IMAGE_NAME: ${{ inputs.image_name }}
         run: |
           set -euo pipefail
@@ -103,7 +109,7 @@ jobs:
           fi
 
           # -- 2. 路径参数校验（必须为相对路径，且不得包含 ..）--
-          for p in "$DOCKERFILE_PATH" "$COMPOSE_FILE_PATH"; do
+          for p in "$DOCKERFILE_PATH" "$COMPOSE_FILE_PATH" "$ENV_FILE_DIR"; do
             [[ -z "$p" ]] && continue
             [[ "$p" == /* ]] && fail "路径参数必须为相对路径（相对目标仓库根目录）：$p"
             [[ "$p" == *..* ]] && fail "路径参数不得包含 '..'：$p"
@@ -204,7 +210,41 @@ jobs:
           echo "REGISTRY_LOGGED_IN=1" >> "$GITHUB_ENV"
 
       # ---------------------------------------------------------------
-      # Step 6A: 模式 build —— 从 Dockerfile 构建镜像
+      # Step 6: 准备环境变量文件（.env，可选）
+      #   部分项目的 Docker build / Compose pull 会读取 .env，而仓库通常只
+      #   提供 .env.example 模板。若指定目录下存在 .env.example 且不存在
+      #   .env，则自动复制一份，避免因缺少 .env 导致构建/拉取失败。
+      #   env_file_dir 留空表示目标仓库根目录。
+      # ---------------------------------------------------------------
+      - name: 准备环境变量文件（.env）
+        working-directory: target-repo
+        env:
+          ENV_FILE_DIR: ${{ inputs.env_file_dir }}
+        run: |
+          set -euo pipefail
+
+          # 留空时使用目标仓库根目录
+          TARGET_PATH="${ENV_FILE_DIR:-.}"
+          if [[ ! -d "$TARGET_PATH" ]]; then
+            echo "::error::环境变量文件目录不存在：$TARGET_PATH（路径相对于目标仓库根目录）"
+            exit 1
+          fi
+
+          if [[ -f "$TARGET_PATH/.env" ]]; then
+            echo "ℹ️ $TARGET_PATH/.env 已存在，跳过生成"
+            exit 0
+          fi
+
+          if [[ ! -f "$TARGET_PATH/.env.example" ]]; then
+            echo "ℹ️ 未找到 $TARGET_PATH/.env.example，跳过生成（如项目无需 .env 可忽略）"
+            exit 0
+          fi
+
+          cp "$TARGET_PATH/.env.example" "$TARGET_PATH/.env"
+          echo "✅ 已根据 .env.example 生成 $TARGET_PATH/.env"
+
+      # ---------------------------------------------------------------
+      # Step 7A: 模式 build —— 从 Dockerfile 构建镜像
       #   注意：setup-buildx 之后默认构建器为 docker-container 驱动，
       #   构建结果不会自动进入本地镜像库，必须显式 --load 才能 docker save
       # ---------------------------------------------------------------
@@ -242,7 +282,7 @@ jobs:
           echo "✅ 镜像构建完成：$IMAGE_NAME"
 
       # ---------------------------------------------------------------
-      # Step 6B: 模式 pull —— 从 Compose 文件拉取全部镜像
+      # Step 7B: 模式 pull —— 从 Compose 文件拉取全部镜像
       #   不启动任何容器：先解析 Compose 得到镜像清单，
       #   再逐个以 --platform 强制拉取目标架构，避免拉到 Runner 默认架构
       # ---------------------------------------------------------------
@@ -306,7 +346,7 @@ jobs:
           echo "✅ 全部镜像拉取完成"
 
       # ---------------------------------------------------------------
-      # Step 7: 验证镜像架构
+      # Step 8: 验证镜像架构
       #   逐一检查本地镜像的 Os/Architecture 是否与目标平台一致，
       #   防止拉错/构建错架构的镜像被打进离线包（元数据为 unknown 的
       #   老镜像跳过强校验，仅告警）
@@ -349,7 +389,7 @@ jobs:
           echo "✅ 全部镜像架构校验通过"
 
       # ---------------------------------------------------------------
-      # Step 8: docker save 导出全部镜像，并压缩为 TGZ
+      # Step 9: docker save 导出全部镜像，并压缩为 TGZ
       #   文件名：<repo-name>_docker-images_<platform>_<mode>_<yyyymmdd-HHMMSS>.tgz
       #   Artifact 命名：与文件名同基名（不含 .tgz 扩展名）
       #   repo-name 取自 repo_url 的项目名；时间戳使用 Asia/Shanghai 时区
@@ -419,7 +459,7 @@ jobs:
           ls -lh dist/
 
       # ---------------------------------------------------------------
-      # Step 9: 上传 TGZ Artifact
+      # Step 10: 上传 TGZ Artifact
       #   每次运行的产物通过时间戳区分，互不覆盖
       #   注：Artifact 下载后为 zip 包，解压即得到 TGZ 文件
       # ---------------------------------------------------------------
@@ -432,7 +472,7 @@ jobs:
           if-no-files-found: error
 
       # ---------------------------------------------------------------
-      # Step 10: 输出运行摘要（显示在运行页面底部的 Summary 区域）
+      # Step 11: 输出运行摘要（显示在运行页面底部的 Summary 区域）
       #   包含：配置参数、产物文件名/大小/SHA256、镜像清单（架构+大小）、
       #   目标服务器导入方法；失败时给出排查指引
       # ---------------------------------------------------------------
@@ -535,7 +575,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # ---------------------------------------------------------------
-      # Step 11: 登出镜像仓库（若曾登录，尽力而为）
+      # Step 12: 登出镜像仓库（若曾登录，尽力而为）
       # ---------------------------------------------------------------
       - name: 登出镜像仓库
         if: ${{ always() && env.REGISTRY_LOGGED_IN == '1' }}
@@ -543,7 +583,7 @@ jobs:
         run: docker logout || true
 
       # ---------------------------------------------------------------
-      # Step 12: 清理 Docker 缓存（尽力而为，失败不影响结果）
+      # Step 13: 清理 Docker 缓存（尽力而为，失败不影响结果）
       #   注意：带 tag 的镜像不会被删除，仅清理构建缓存/悬空层
       # ---------------------------------------------------------------
       - name: 清理 Docker 缓存
