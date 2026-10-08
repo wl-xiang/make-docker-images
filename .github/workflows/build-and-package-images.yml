@@ -408,7 +408,7 @@ jobs:
 
       # ---------------------------------------------------------------
       # Step 9: docker save 导出全部镜像，并压缩为 TGZ
-      #   文件名：<repo-name>_docker-images_<platform>_<mode>_<yyyymmdd-HHMMSS>.tgz
+      #   文件名：<repo-name>_docker-images_<platform>_<yyyymmdd-HHMMSS>.tgz
       #   Artifact 命名：与文件名同基名（不含 .tgz 扩展名）
       #   repo-name 取自 repo_url 的项目名；时间戳使用 Asia/Shanghai 时区
       # ---------------------------------------------------------------
@@ -416,7 +416,6 @@ jobs:
         env:
           REPO_URL: ${{ inputs.repo_url }}
           PLATFORM: ${{ inputs.platform }}
-          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
 
@@ -434,7 +433,7 @@ jobs:
           # 北京时间戳，形如 20261009-153045
           TIMESTAMP="$(TZ='Asia/Shanghai' date +%Y%m%d-%H%M%S)"
 
-          ARTIFACT_NAME="${REPO_NAME}_docker-images_${PLATFORM_TAG}_${MODE}_${TIMESTAMP}"
+          ARTIFACT_NAME="${REPO_NAME}_docker-images_${PLATFORM_TAG}_${TIMESTAMP}"
           TGZ_NAME="${ARTIFACT_NAME}.tgz"
 
           if [[ ! -s "$IMAGE_LIST_FILE" ]]; then

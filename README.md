@@ -25,7 +25,7 @@
 └─────────────────────┘
           │
           ▼
-  <repo-name>_docker-images_<platform>_<mode>_<yyyymmdd-HHMMSS>.tgz（可下载，离线部署用）
+  <repo-name>_docker-images_<platform>_<yyyymmdd-HHMMSS>.tgz（可下载，离线部署用）
 ```
 
 ## 使用方法
@@ -109,8 +109,8 @@ workflow 会：
 每次运行产出**一个 TGZ 文件**，命名规范：
 
 ```
-<repo-name>_docker-images_<platform>_<mode>_<yyyymmdd-HHMMSS>.tgz
-例如：code-server-ai_docker-images_linux-amd64_build_20261009-153045.tgz
+<repo-name>_docker-images_<platform>_<yyyymmdd-HHMMSS>.tgz
+例如：code-server-ai_docker-images_linux-amd64_20261009-153045.tgz
 ```
 
 - `<repo-name>`：取自 `repo_url` 的项目名（如 `https://github.com/wl-xiang/code-server-ai.git` → `code-server-ai`）
@@ -124,18 +124,18 @@ workflow 会：
 
 ### 下载后在目标服务器导入
 
-从 run 页面 **Artifacts** 区域下载（例如 `code-server-ai_docker-images_linux-amd64_build_20261009-153045`，下载得到的是 zip，**解压后即为 TGZ 文件**）：
+从 run 页面 **Artifacts** 区域下载（例如 `code-server-ai_docker-images_linux-amd64_20261009-153045`，下载得到的是 zip，**解压后即为 TGZ 文件**）：
 
 ```bash
 # 0. 校验完整性（可选，SHA256 值见 run 页面的 Summary）
-echo "<summary 中的 sha256>  code-server-ai_docker-images_linux-amd64_build_20261009-153045.tgz" | sha256sum -c
+echo "<summary 中的 sha256>  code-server-ai_docker-images_linux-amd64_20261009-153045.tgz" | sha256sum -c
 
 # 方式一：gunzip 后导入
-gunzip code-server-ai_docker-images_linux-amd64_build_20261009-153045.tgz
-docker load -i code-server-ai_docker-images_linux-amd64_build_20261009-153045.tar
+gunzip code-server-ai_docker-images_linux-amd64_20261009-153045.tgz
+docker load -i code-server-ai_docker-images_linux-amd64_20261009-153045.tar
 
 # 方式二：一步到位（推荐）
-docker load -i <(gunzip -c code-server-ai_docker-images_linux-amd64_build_20261009-153045.tgz)
+docker load -i <(gunzip -c code-server-ai_docker-images_linux-amd64_20261009-153045.tgz)
 
 # 验证镜像已导入
 docker images
