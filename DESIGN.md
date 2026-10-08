@@ -71,7 +71,7 @@
 
 ### Step 5：打包产出 Artifact
 
-1. 将镜像 tar 包压缩为 TGZ 格式，命名建议：`<repo-name>_docker-images_<platform>_<mode>_<yyyymmdd-HHMMSS>.tgz`（`<repo-name>` 取自 `repo_url` 的项目名，时间戳使用北京时间）
+1. 将镜像 tar 包压缩为 TGZ 格式，命名建议：`<repo-name>_docker-images_<platform>_<yyyymmdd-HHMMSS>.tgz`（`<repo-name>` 取自 `repo_url` 的项目名，时间戳使用北京时间）
 2. 使用 `actions/upload-artifact` 上传该 TGZ 文件
 
 ---
@@ -81,7 +81,7 @@
 - **唯一产出**：一个 TGZ 文件，包含本次 workflow 涉及的全部镜像
   - `build` 模式：1 个镜像
   - `pull` 模式：Compose 文件中定义/拉取的全部镜像
-- Artifact 命名规范：`<repo-name>_docker-images_<platform>_<mode>_<yyyymmdd-HHMMSS>`（以时间戳区分版本，互不覆盖）
+- Artifact 命名规范：`<repo-name>_docker-images_<platform>_<yyyymmdd-HHMMSS>`（以时间戳区分版本，互不覆盖）
 - Artifact 保留期（retention-days）：建议 7~30 天
 
 ---
