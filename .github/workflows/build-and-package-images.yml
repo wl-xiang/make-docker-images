@@ -3,9 +3,11 @@
 #
 # 完整链路：Git Clone 用户仓库 → 构建或拉取 Docker 镜像 → 打包 → 产出 TGZ Artifact
 #
-# 两种模式：
-#   build : 从用户仓库的 Dockerfile 构建镜像（支持跨平台，QEMU 模拟）
-#   pull  : 解析用户仓库的 Compose 文件，拉取其中定义的全部镜像
+# 三种模式：
+#   docker build : 从用户仓库的 Dockerfile 构建镜像（支持跨平台，QEMU 模拟）
+#   compose pull : 解析用户仓库的 Compose 文件，拉取其中定义的全部镜像（服务必须声明 image:）
+#   compose auto : 解析 Compose 文件，按服务自动处理 —— 声明 image: 则拉取，
+#                  仅声明 build:（无 image:）则用 Compose 构建该服务镜像
 #
 # 触发方式：workflow_dispatch（手动触发）
 #
@@ -34,20 +36,21 @@ on:
           - linux/amd64
           - linux/arm64
       mode:
-        description: '镜像获取模式：build = 从 Dockerfile 构建，pull = 从 Compose 拉取'
+        description: '镜像获取模式：docker build = 从 Dockerfile 构建；compose pull = 从 Compose 拉取；compose auto = 按 Compose 服务自动构建/拉取'
         required: true
         type: choice
-        default: build
+        default: docker build
         options:
-          - build
-          - pull
+          - docker build
+          - compose pull
+          - compose auto
       dockerfile_path:
-        description: 'Dockerfile 路径（仅 mode=build 生效）。根目录填 Dockerfile，子目录填 path/to/Dockerfile'
+        description: 'Dockerfile 路径（仅 mode=docker build 生效）。根目录填 Dockerfile，子目录填 path/to/Dockerfile'
         required: false
         default: 'Dockerfile'
         type: string
       compose_file_path:
-        description: 'Docker Compose 文件路径（仅 mode=pull 生效）'
+        description: 'Docker Compose 文件路径（仅 mode=compose pull / compose auto 生效）'
         required: false
         default: 'docker-compose.yml'
         type: string
@@ -56,8 +59,18 @@ on:
         required: false
         default: ''
         type: string
+      force_env:
+        description: '是否强制在目标路径生成一个空的 .env 文件（目标位置无 .env 时创建）'
+        required: false
+        type: boolean
+        default: false
+      env_path:
+        description: '.env 文件生成目录（相对目标仓库根目录），留空表示项目根目录；仅 force_env=true 时生效'
+        required: false
+        default: ''
+        type: string
       image_name:
-        description: '镜像名称与 tag（仅 mode=build 生效），例如 myimg:latest。留空则默认使用 <repo_name>:latest（repo_name 取自 repo_url 的项目名）'
+        description: '镜像名称与 tag（仅 mode=docker build 生效），例如 myimg:latest。留空则默认使用 <repo_name>:latest（repo_name 取自 repo_url 的项目名）'
         required: false
         default: ''
         type: string
@@ -95,6 +108,8 @@ jobs:
           DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
           COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
           ENV_FILE_DIR: ${{ inputs.env_file_dir }}
+          FORCE_ENV: ${{ inputs.force_env }}
+          ENV_PATH: ${{ inputs.env_path }}
           IMAGE_NAME: ${{ inputs.image_name }}
         run: |
           set -euo pipefail
@@ -109,17 +124,17 @@ jobs:
           fi
 
           # -- 2. 路径参数校验（必须为相对路径，且不得包含 ..）--
-          for p in "$DOCKERFILE_PATH" "$COMPOSE_FILE_PATH" "$ENV_FILE_DIR"; do
+          for p in "$DOCKERFILE_PATH" "$COMPOSE_FILE_PATH" "$ENV_FILE_DIR" "$ENV_PATH"; do
             [[ -z "$p" ]] && continue
             [[ "$p" == /* ]] && fail "路径参数必须为相对路径（相对目标仓库根目录）：$p"
             [[ "$p" == *..* ]] && fail "路径参数不得包含 '..'：$p"
           done
 
           # -- 3. 模式联动校验 --
-          if [[ "$MODE" == "build" ]]; then
+          if [[ "$MODE" == "docker build" ]]; then
             if [[ -z "${IMAGE_NAME// /}" ]]; then
               # 留空时构建阶段将默认使用 <repo_name>:latest，此处跳过格式校验
-              echo "mode=build：未填写 image_name，构建时将默认使用 <repo_name>:latest"
+              echo "mode=docker build：未填写 image_name，构建时将默认使用 <repo_name>:latest"
             else
               if [[ "$IMAGE_NAME" != *:* ]]; then
                 fail "image_name 必须包含冒号 ':'（即必须显式指定 tag，格式 name:tag），当前值：$IMAGE_NAME"
@@ -144,7 +159,7 @@ jobs:
               fi
             fi
           else
-            echo "mode=pull：image_name 将被忽略（镜像列表由 Compose 文件决定）"
+            echo "mode=$MODE：image_name 将被忽略（镜像列表由 Compose 文件决定）"
           fi
 
           echo "✅ 输入参数校验通过（mode=$MODE，platform=$PLATFORM）"
@@ -193,7 +208,8 @@ jobs:
       # ---------------------------------------------------------------
       # Step 5: 登录私有镜像仓库（可选）
       #   配置了 REGISTRY_USERNAME / REGISTRY_PASSWORD secrets 时自动生效，
-      #   用于 build 模式拉取私有基础镜像、pull 模式拉取私有业务镜像
+      #   用于 docker build 模式拉取私有基础镜像、compose pull / compose auto
+      #   模式拉取私有业务镜像
       # ---------------------------------------------------------------
       - name: 登录镜像仓库（可选）
         env:
@@ -213,19 +229,23 @@ jobs:
 
       # ---------------------------------------------------------------
       # Step 6: 准备环境变量文件（.env，可选）
-      #   部分项目的 Docker build / Compose pull 会读取 .env，而仓库通常只
-      #   提供 .env.example 模板。若指定目录下存在 .env.example 且不存在
-      #   .env，则自动复制一份，避免因缺少 .env 导致构建/拉取失败。
-      #   env_file_dir 留空表示目标仓库根目录。
+      #   1) 常规：部分项目的 Docker build / Compose pull 会读取 .env，而仓库
+      #      通常只提供 .env.example 模板。若指定目录下存在 .env.example 且不
+      #      存在 .env，则自动复制一份，避免因缺少 .env 导致构建/拉取失败。
+      #      env_file_dir 留空表示目标仓库根目录。
+      #   2) 强制：force_env=true 时，在 env_path 指定目录（留空表示目标仓库
+      #      根目录）强制生成一个空的 .env 文件（仅当该位置不存在 .env 时创建）。
       # ---------------------------------------------------------------
       - name: 准备环境变量文件（.env）
         working-directory: target-repo
         env:
           ENV_FILE_DIR: ${{ inputs.env_file_dir }}
+          FORCE_ENV: ${{ inputs.force_env }}
+          ENV_PATH: ${{ inputs.env_path }}
         run: |
           set -euo pipefail
 
-          # 留空时使用目标仓库根目录
+          # -- 1. 常规：从 .env.example 复制（留空时使用目标仓库根目录）--
           TARGET_PATH="${ENV_FILE_DIR:-.}"
           if [[ ! -d "$TARGET_PATH" ]]; then
             echo "::error::环境变量文件目录不存在：$TARGET_PATH（路径相对于目标仓库根目录）"
@@ -233,25 +253,36 @@ jobs:
           fi
 
           if [[ -f "$TARGET_PATH/.env" ]]; then
-            echo "ℹ️ $TARGET_PATH/.env 已存在，跳过生成"
-            exit 0
+            echo "ℹ️ $TARGET_PATH/.env 已存在，跳过复制"
+          elif [[ ! -f "$TARGET_PATH/.env.example" ]]; then
+            echo "ℹ️ 未找到 $TARGET_PATH/.env.example，跳过复制（如项目无需 .env 可忽略）"
+          else
+            cp "$TARGET_PATH/.env.example" "$TARGET_PATH/.env"
+            echo "✅ 已根据 .env.example 生成 $TARGET_PATH/.env"
           fi
 
-          if [[ ! -f "$TARGET_PATH/.env.example" ]]; then
-            echo "ℹ️ 未找到 $TARGET_PATH/.env.example，跳过生成（如项目无需 .env 可忽略）"
-            exit 0
+          # -- 2. 强制：生成空 .env（force_env=true 时生效）--
+          if [[ "${FORCE_ENV:-false}" == "true" ]]; then
+            FORCE_PATH="${ENV_PATH:-.}"
+            if [[ ! -d "$FORCE_PATH" ]]; then
+              echo "::error::env_path 目录不存在：$FORCE_PATH（路径相对于目标仓库根目录）"
+              exit 1
+            fi
+            if [[ -f "$FORCE_PATH/.env" ]]; then
+              echo "ℹ️ $FORCE_PATH/.env 已存在，跳过强制生成"
+            else
+              : > "$FORCE_PATH/.env"
+              echo "✅ 已强制生成空 .env：$FORCE_PATH/.env"
+            fi
           fi
-
-          cp "$TARGET_PATH/.env.example" "$TARGET_PATH/.env"
-          echo "✅ 已根据 .env.example 生成 $TARGET_PATH/.env"
 
       # ---------------------------------------------------------------
-      # Step 7A: 模式 build —— 从 Dockerfile 构建镜像
+      # Step 7A: 模式 docker build —— 从 Dockerfile 构建镜像
       #   注意：setup-buildx 之后默认构建器为 docker-container 驱动，
       #   构建结果不会自动进入本地镜像库，必须显式 --load 才能 docker save
       # ---------------------------------------------------------------
-      - name: 构建镜像（mode=build）
-        if: ${{ inputs.mode == 'build' }}
+      - name: 构建镜像（mode=docker build）
+        if: ${{ inputs.mode == 'docker build' }}
         working-directory: target-repo
         env:
           REPO_URL: ${{ inputs.repo_url }}
@@ -300,12 +331,12 @@ jobs:
           echo "✅ 镜像构建完成：$IMAGE_NAME"
 
       # ---------------------------------------------------------------
-      # Step 7B: 模式 pull —— 从 Compose 文件拉取全部镜像
+      # Step 7B: 模式 compose pull —— 从 Compose 文件拉取全部镜像
       #   不启动任何容器：先解析 Compose 得到镜像清单，
       #   再逐个以 --platform 强制拉取目标架构，避免拉到 Runner 默认架构
       # ---------------------------------------------------------------
-      - name: 拉取 Compose 镜像（mode=pull）
-        if: ${{ inputs.mode == 'pull' }}
+      - name: 拉取 Compose 镜像（mode=compose pull）
+        if: ${{ inputs.mode == 'compose pull' }}
         working-directory: target-repo
         env:
           COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
@@ -326,13 +357,14 @@ jobs:
             exit 1
           fi
 
-          # 检测 build 型服务（声明了 build: 字段）：pull 模式只负责拉取，不执行构建
+          # 检测 build 型服务（声明了 build: 字段）：compose pull 只负责拉取，不执行构建
           BUILD_SVCS=$(jq -r '.services | to_entries[] | select(.value.build != null) | .key' <<<"$CONFIG_JSON" | grep -v '^$' || true)
           if [[ -n "$BUILD_SVCS" ]]; then
             echo "::error::Compose 文件中存在 build 型服务（声明了 build: 字段）：$(echo "$BUILD_SVCS" | xargs)"
-            echo "pull 模式只负责拉取镜像，不执行构建。请任选其一："
+            echo "compose pull 只负责拉取镜像，不执行构建。请任选其一："
             echo "  1. 在目标仓库中为这些服务补充 image: 字段（指向 registry 中已存在的镜像）"
-            echo "  2. 改用 build 模式（单一 Dockerfile）"
+            echo "  2. 改用 compose auto 模式（声明 image: 的服务拉取，仅声明 build: 的服务自动构建）"
+            echo "  3. 改用 docker build 模式（单一 Dockerfile）"
             exit 1
           fi
 
@@ -362,6 +394,100 @@ jobs:
           # 记录镜像列表，供导出步骤统一消费
           echo "$IMAGES" > "$GITHUB_WORKSPACE/$IMAGE_LIST_FILE"
           echo "✅ 全部镜像拉取完成"
+
+      # ---------------------------------------------------------------
+      # Step 7C: 模式 compose auto —— 按 Compose 服务自动「拉取 / 构建」
+      #   规则：服务声明了 image:            → 拉取该镜像
+      #         服务仅声明 build:（无 image:）→ 用 Compose 构建该服务镜像
+      #   构建型镜像由 Compose 按 <project>-<service> 命名；项目名优先取
+      #   Compose 文件顶层 name:，否则取目标仓库名（避免默认落到克隆目录名
+      #   target-repo），保证离线导入到目标服务器后镜像名可预期。
+      # ---------------------------------------------------------------
+      - name: 自动构建/拉取 Compose 镜像（mode=compose auto）
+        if: ${{ inputs.mode == 'compose auto' }}
+        working-directory: target-repo
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          # Compose 文件存在性检查（为空时使用默认值）
+          COMPOSE_FILE_PATH="${COMPOSE_FILE_PATH:-docker-compose.yml}"
+          if [[ ! -f "$COMPOSE_FILE_PATH" ]]; then
+            echo "::error::未找到 Compose 文件：$COMPOSE_FILE_PATH（路径相对于目标仓库根目录）"
+            exit 1
+          fi
+
+          # 目标仓库名（用于 Compose 项目名，保证构建型镜像名可预期）
+          REPO_NAME="${REPO_URL%/}"
+          REPO_NAME="${REPO_NAME%.git}"
+          REPO_NAME="${REPO_NAME##*/}"
+          REPO_NAME="${REPO_NAME,,}"
+
+          # Compose 项目名：文件未显式声明顶层 name: 时，用仓库名替代默认的克隆目录名
+          if ! grep -Eq '^name[[:space:]]*:' "$COMPOSE_FILE_PATH"; then
+            export COMPOSE_PROJECT_NAME="$REPO_NAME"
+          fi
+
+          # 解析 Compose 文件（格式错误、引用了未定义的环境变量等会在这里失败）
+          if ! CONFIG_JSON=$(docker compose -f "$COMPOSE_FILE_PATH" config --format json 2>/dev/null); then
+            echo "::error::解析 Compose 文件失败：$COMPOSE_FILE_PATH。请确认文件格式正确、引用的环境变量已有定义或默认值"
+            exit 1
+          fi
+
+          # 项目名（与 Compose 构建时使用的名称保持一致）
+          PROJECT_NAME="$(jq -r '.name // empty' <<<"$CONFIG_JSON")"
+          PROJECT_NAME="${PROJECT_NAME:-$REPO_NAME}"
+
+          # 分类：声明 image: 的服务 → 拉取；仅声明 build:（无 image:）的服务 → 构建
+          mapfile -t PULL_IMAGES < <(jq -r '.services[] | select(.image != null) | .image' <<<"$CONFIG_JSON" | sort -u | grep -v '^$' || true)
+          mapfile -t BUILD_SVCS < <(jq -r '.services | to_entries[] | select(.value.build != null and (.value.image == null)) | .key' <<<"$CONFIG_JSON" | grep -v '^$' || true)
+
+          if [[ ${#PULL_IMAGES[@]} -eq 0 && ${#BUILD_SVCS[@]} -eq 0 ]]; then
+            echo "::error::Compose 文件中未解析到任何镜像服务，请检查 services.*.image / services.*.build 配置"
+            exit 1
+          fi
+
+          echo "📥 拉取型服务镜像（声明了 image）：${PULL_IMAGES[*]:-无}"
+          echo "🔨 构建型服务（仅声明 build，无 image）：${BUILD_SVCS[*]:-无}"
+
+          # 1) 拉取：逐个以 --platform 强制拉取目标架构
+          for img in "${PULL_IMAGES[@]}"; do
+            [[ -z "$img" ]] && continue
+            if ! docker pull --platform "$PLATFORM" "$img"; then
+              echo "::error::拉取镜像失败：$img（平台：$PLATFORM）"
+              echo "可能原因：镜像名拼写错误 / 镜像不存在 / 该镜像不支持目标架构 / 私有镜像仓库未配置登录（见 README「私有镜像仓库支持」）"
+              exit 1
+            fi
+          done
+
+          # 2) 构建：交给 Compose 处理 context/dockerfile/args/target，并按 <project>-<service> 命名
+          if [[ ${#BUILD_SVCS[@]} -gt 0 ]]; then
+            echo "🔨 开始构建构建型服务镜像（平台：$PLATFORM）：${BUILD_SVCS[*]}"
+            if ! DOCKER_DEFAULT_PLATFORM="$PLATFORM" docker compose -f "$COMPOSE_FILE_PATH" build "${BUILD_SVCS[@]}"; then
+              echo "::error::构建型服务镜像构建失败，请检查对应服务的 build 配置及其依赖的网络资源是否可访问"
+              exit 1
+            fi
+          fi
+
+          # 汇总镜像清单：拉取型用 image:，构建型用 <project>-<service>
+          {
+            printf '%s\n' "${PULL_IMAGES[@]}"
+            for svc in "${BUILD_SVCS[@]}"; do
+              [[ -z "$svc" ]] && continue
+              echo "${PROJECT_NAME}-${svc}"
+            done
+          } | grep -v '^[[:space:]]*$' | sort -u > "$GITHUB_WORKSPACE/$IMAGE_LIST_FILE"
+
+          if [[ ! -s "$GITHUB_WORKSPACE/$IMAGE_LIST_FILE" ]]; then
+            echo "::error::镜像清单为空，无法导出"
+            exit 1
+          fi
+
+          echo "✅ Compose auto 完成，镜像清单："
+          cat "$GITHUB_WORKSPACE/$IMAGE_LIST_FILE"
 
       # ---------------------------------------------------------------
       # Step 8: 验证镜像架构
@@ -534,7 +660,7 @@ jobs:
             echo "| 目标仓库 | \`${REPO_URL}\` |"
             echo "| 模式 | \`${MODE}\` |"
             echo "| 目标平台 | \`${PLATFORM}\` |"
-            if [[ "$MODE" == "build" ]]; then
+            if [[ "$MODE" == "docker build" ]]; then
               echo "| Dockerfile | \`${DOCKERFILE_PATH:-Dockerfile}\` |"
               echo "| 镜像名称 | \`${IMAGE_NAME}\` |"
             else
