@@ -1,21 +1,27 @@
 # =====================================================================
 # Build and Package Docker Images
 #
-# 完整链路：Git Clone 用户仓库 → 构建或拉取 Docker 镜像 → 打包 → 产出 TGZ Artifact
+# 完整链路：Git Clone 用户仓库 → 构建或拉取 Docker 镜像 → 打包产出 TGZ Artifact 或推送到 GHCR
 #
-# 三种模式：
+# 三种获取模式（mode）：
 #   docker build : 从用户仓库的 Dockerfile 构建镜像（支持跨平台，QEMU 模拟）
 #   compose pull : 解析用户仓库的 Compose 文件，拉取其中定义的全部镜像（服务必须声明 image:）
 #   compose auto : 解析 Compose 文件，按服务自动处理 —— 声明 image: 则拉取，
 #                  仅声明 build:（无 image:）则用 Compose 构建该服务镜像
 #
+# 两种交付方式（delivery_mode）：
+#   pack : 将全部镜像 docker save 并压缩为 TGZ，上传到 Artifacts（默认）
+#   push : 将全部镜像重新打标签为 ghcr.io/<owner>/<repo>/<镜像名>:<tag> 并推送到 GHCR；
+#          不再产出 Artifact，摘要中给出拉取命令与国内加速代理
+#
 # 触发方式：workflow_dispatch（手动触发）
 #
 # 可选 Secrets：
 #   CLONE_PAT          克隆私有 Git 仓库用的 PAT（repo 读权限）
-#   REGISTRY_SERVER    私有镜像仓库地址（如 ghcr.io / registry.example.com:5000，默认 docker.io）
+#   REGISTRY_SERVER    私有镜像仓库地址（如 registry.example.com:5000，默认 docker.io）
 #   REGISTRY_USERNAME  私有镜像仓库用户名
 #   REGISTRY_PASSWORD  私有镜像仓库密码/令牌
+#   （push 到 GHCR 使用内置 GITHUB_TOKEN，无需额外配置 secret）
 # =====================================================================
 
 name: Build and Package Docker Images
@@ -44,6 +50,14 @@ on:
           - docker build
           - compose pull
           - compose auto
+      delivery_mode:
+        description: '镜像交付方式：pack = 打包为 TGZ 上传到 Artifacts；push = 推送到 GHCR 镜像仓库（ghcr.io/<owner>/<repo>/...）'
+        required: true
+        type: choice
+        default: pack
+        options:
+          - pack
+          - push
       dockerfile_path:
         description: 'Dockerfile 路径（仅 mode=docker build 生效）。根目录填 Dockerfile，子目录填 path/to/Dockerfile'
         required: false
@@ -77,12 +91,19 @@ on:
 
 permissions:
   contents: read
+  # push 到 GHCR 需要 packages: write（GITHUB_TOKEN 默认权限不足时需在仓库设置中放开）
+  packages: write
 
 env:
   # 克隆目标仓库的本地目录名
   TARGET_DIR: target-repo
-  # 镜像列表文件（build/pull 两个分支共同写入，导出步骤统一消费）
+  # 镜像列表文件（build/pull 两个分支共同写入，导出/推送步骤统一消费）
   IMAGE_LIST_FILE: image-list.txt
+  # GHCR 相关常量（delivery_mode=push 时使用）
+  GHCR_REGISTRY: ghcr.io
+  GHCR_OWNER: ${{ github.repository_owner }}
+  # 推送成功清单（原镜像<TAB>GHCR目标名），供摘要步骤消费
+  GHCR_PUSHED_FILE: ghcr-pushed.txt
 
 jobs:
   build-and-package:
@@ -105,6 +126,7 @@ jobs:
           REPO_URL: ${{ inputs.repo_url }}
           PLATFORM: ${{ inputs.platform }}
           MODE: ${{ inputs.mode }}
+          DELIVERY_MODE: ${{ inputs.delivery_mode }}
           DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
           COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
           ENV_FILE_DIR: ${{ inputs.env_file_dir }}
@@ -162,7 +184,12 @@ jobs:
             echo "mode=$MODE：image_name 将被忽略（镜像列表由 Compose 文件决定）"
           fi
 
-          echo "✅ 输入参数校验通过（mode=$MODE，platform=$PLATFORM）"
+          # -- 4. 交付方式校验 --
+          if [[ "$DELIVERY_MODE" != "pack" && "$DELIVERY_MODE" != "push" ]]; then
+            fail "delivery_mode 取值非法（当前值：$DELIVERY_MODE），只允许 pack 或 push"
+          fi
+
+          echo "✅ 输入参数校验通过（mode=$MODE，delivery_mode=$DELIVERY_MODE，platform=$PLATFORM）"
 
       # ---------------------------------------------------------------
       # Step 3: 浅克隆用户目标仓库
@@ -555,10 +582,94 @@ jobs:
           done < "$IMAGE_LIST_FILE"
 
           if [[ "$MISMATCH" -ne 0 ]]; then
-            echo "::error::存在架构不匹配的镜像，已终止打包。请检查镜像是否支持目标平台"
+            echo "::error::存在架构不匹配的镜像，已终止后续步骤。请检查镜像是否支持目标平台"
             exit 1
           fi
           echo "✅ 全部镜像架构校验通过"
+
+      # ---------------------------------------------------------------
+      # Step 8B: 登录 GHCR（仅 delivery_mode=push）
+      #   使用内置 GITHUB_TOKEN（需 packages: write 权限，见文件顶部 permissions）
+      # ---------------------------------------------------------------
+      - name: 登录 GHCR（delivery_mode=push）
+        if: ${{ inputs.delivery_mode == 'push' }}
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          echo "🔐 登录 GHCR：$GHCR_REGISTRY（用户：$GHCR_ACTOR）"
+          if ! echo "$GHCR_TOKEN" | docker login "$GHCR_REGISTRY" --username "$GHCR_ACTOR" --password-stdin; then
+            echo "::error::登录 GHCR 失败。请确认："
+            echo "  1. workflow 已声明 packages: write 权限"
+            echo "  2. 组织/仓库未禁止 GITHUB_TOKEN 创建包（Settings → Actions → General → Workflow permissions）"
+            exit 1
+          fi
+          echo "GHCR_LOGGED_IN=1" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # Step 8C: 推送镜像到 GHCR（仅 delivery_mode=push）
+      #   将 IMAGE_LIST_FILE 中的全部镜像重新打标签为
+      #   ghcr.io/<owner>/<repo>/<镜像名>:<tag> 并逐个推送；
+      #   推送结果写入 GHCR_PUSHED_FILE，供摘要步骤展示拉取方式
+      # ---------------------------------------------------------------
+      - name: 推送镜像到 GHCR（delivery_mode=push）
+        if: ${{ inputs.delivery_mode == 'push' }}
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! -s "$IMAGE_LIST_FILE" ]]; then
+            echo "::error::未找到镜像列表文件 $IMAGE_LIST_FILE，前置步骤可能未执行"
+            exit 1
+          fi
+
+          # GHCR 路径要求全小写
+          OWNER="${GHCR_OWNER,,}"
+          REPO_NAME="${REPO_URL%/}"
+          REPO_NAME="${REPO_NAME%.git}"
+          REPO_NAME="${REPO_NAME##*/}"
+          REPO_NAME="${REPO_NAME,,}"
+          if [[ -z "$OWNER" || -z "$REPO_NAME" ]]; then
+            echo "::error::无法解析 GHCR 命名空间（owner=$OWNER，repo=$REPO_NAME）"
+            exit 1
+          fi
+
+          NAMESPACE="${GHCR_REGISTRY}/${OWNER}/${REPO_NAME}"
+
+          mapfile -t IMAGES < <(grep -v '^[[:space:]]*$' "$IMAGE_LIST_FILE" || true)
+          if [[ ${#IMAGES[@]} -eq 0 ]]; then
+            echo "::error::镜像列表为空，无法推送"
+            exit 1
+          fi
+
+          : > "$GITHUB_WORKSPACE/$GHCR_PUSHED_FILE"
+
+          echo "📤 推送 ${#IMAGES[@]} 个镜像到 $NAMESPACE/"
+          for img in "${IMAGES[@]}"; do
+            # 取镜像基名（去掉 registry 与命名空间，如 docker.io/library/redis:7 → redis:7）
+            base="${img##*/}"
+            base="${base%%@*}"                              # 去掉可能的 digest（name@sha256:...）
+            [[ "$base" != *:* ]] && base="${base}:latest"   # 无 tag 时补 latest
+            target="${NAMESPACE}/${base}"
+
+            echo "🏷️  ${img}  →  ${target}"
+            if ! docker tag "$img" "$target"; then
+              echo "::error::打标签失败：$img → $target"
+              exit 1
+            fi
+            if ! docker push "$target"; then
+              echo "::error::推送镜像失败：$target"
+              echo "可能原因：GITHUB_TOKEN 缺少 packages: write 权限 / 命名空间无权限 / 网络异常"
+              exit 1
+            fi
+            printf '%s\t%s\n' "$img" "$target" >> "$GITHUB_WORKSPACE/$GHCR_PUSHED_FILE"
+          done
+
+          echo "GHCR_NAMESPACE=$NAMESPACE" >> "$GITHUB_ENV"
+          echo "GHCR_PUSHED_COUNT=${#IMAGES[@]}" >> "$GITHUB_ENV"
+          echo "✅ 已推送 ${#IMAGES[@]} 个镜像到 $NAMESPACE/"
 
       # ---------------------------------------------------------------
       # Step 9: docker save 导出全部镜像，并压缩为 TGZ
@@ -566,7 +677,8 @@ jobs:
       #   Artifact 命名：与文件名同基名（不含 .tgz 扩展名）
       #   repo-name 取自 repo_url 的项目名；时间戳使用 Asia/Shanghai 时区
       # ---------------------------------------------------------------
-      - name: 导出镜像并压缩为 TGZ
+      - name: 导出镜像并压缩为 TGZ（delivery_mode=pack）
+        if: ${{ inputs.delivery_mode == 'pack' }}
         env:
           REPO_URL: ${{ inputs.repo_url }}
           PLATFORM: ${{ inputs.platform }}
@@ -634,7 +746,8 @@ jobs:
       #   每次运行的产物通过时间戳区分，互不覆盖
       #   注：Artifact 下载后为 zip 包，解压即得到 TGZ 文件
       # ---------------------------------------------------------------
-      - name: 上传 Artifact
+      - name: 上传 Artifact（delivery_mode=pack）
+        if: ${{ inputs.delivery_mode == 'pack' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
@@ -644,8 +757,10 @@ jobs:
 
       # ---------------------------------------------------------------
       # Step 11: 输出运行摘要（显示在运行页面底部的 Summary 区域）
-      #   包含：配置参数、产物文件名/大小/SHA256、镜像清单（架构+大小）、
-      #   目标服务器导入方法；失败时给出排查指引
+      #   通用：配置参数、GitHub Ripple Hotlink（可点击仓库链接）
+      #   delivery_mode=pack：产物文件名/大小/SHA256、镜像清单（架构+大小）、导入方法
+      #   delivery_mode=push：GHCR 命名空间、镜像对照表、拉取命令、国内加速代理
+      #   失败时给出排查指引
       # ---------------------------------------------------------------
       - name: 输出运行摘要
         if: ${{ always() }}
@@ -653,6 +768,7 @@ jobs:
           REPO_URL: ${{ inputs.repo_url }}
           PLATFORM: ${{ inputs.platform }}
           MODE: ${{ inputs.mode }}
+          DELIVERY_MODE: ${{ inputs.delivery_mode }}
           DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
           COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
           INPUT_IMAGE_NAME: ${{ inputs.image_name }}
@@ -663,6 +779,17 @@ jobs:
 
           # 优先使用构建阶段解析出的镜像名（含默认值），否则回退到原始输入
           IMAGE_NAME="${IMAGE_NAME:-$INPUT_IMAGE_NAME}"
+
+          # GitHub 仓库页链接：去掉结尾斜杠与 .git 后缀，作为 Summary 中的可点击 hotlink
+          REPO_LINK="${REPO_URL%/}"
+          REPO_LINK="${REPO_LINK%.git}"
+
+          # 源仓库名与 owner（小写），用于拼出 GHCR 命名空间
+          GHCR_OWNER_LOWER="${GHCR_OWNER,,}"
+          REPO_NAME_SUM="${REPO_URL%/}"
+          REPO_NAME_SUM="${REPO_NAME_SUM%.git}"
+          REPO_NAME_SUM="${REPO_NAME_SUM##*/}"
+          REPO_NAME_LOWER="${REPO_NAME_SUM,,}"
 
           # 取镜像大小（人类可读），镜像已不存在时返回 "-"
           img_size() {
@@ -686,7 +813,9 @@ jobs:
             echo "|---|---|"
             echo "| 运行编号 | #${RUN_NUMBER} |"
             echo "| 目标仓库 | \`${REPO_URL}\` |"
+            echo "| GitHub Ripple Hotlink | <a href=\"${REPO_LINK}\" target=\"_blank\" rel=\"noopener noreferrer\">${REPO_LINK}</a> |"
             echo "| 模式 | \`${MODE}\` |"
+            echo "| 交付方式 | \`${DELIVERY_MODE}\` |"
             echo "| 目标平台 | \`${PLATFORM}\` |"
             if [[ "$MODE" == "docker build" ]]; then
               echo "| Dockerfile | \`${DOCKERFILE_PATH:-Dockerfile}\` |"
@@ -697,7 +826,7 @@ jobs:
             echo "| 运行状态 | \`${JOB_STATUS}\` |"
             echo ""
 
-            if [[ "$JOB_STATUS" == "success" && -n "${TGZ_NAME:-}" && -f "dist/$TGZ_NAME" ]]; then
+            if [[ "$JOB_STATUS" == "success" && "$DELIVERY_MODE" == "pack" && -n "${TGZ_NAME:-}" && -f "dist/$TGZ_NAME" ]]; then
               echo "### ✅ 产出 Artifact"
               echo ""
               echo "| 项目 | 值 |"
@@ -734,15 +863,75 @@ jobs:
               echo "# 3. 验证导入结果"
               echo "docker images"
               echo '```'
-            else
-              echo "### ⚠️ 本次运行未产出 Artifact"
+            elif [[ "$JOB_STATUS" == "success" && "$DELIVERY_MODE" == "push" ]]; then
+              echo "### 🚀 镜像已推送到 GHCR"
               echo ""
-              echo "运行状态：\`${JOB_STATUS}\`。请查看上方失败步骤的日志定位原因，常见问题："
+              echo "| 项目 | 值 |"
+              echo "|---|---|"
+              echo "| GHCR 命名空间 | \`${GHCR_NAMESPACE:-${GHCR_REGISTRY}/${GHCR_OWNER_LOWER}/${REPO_NAME_LOWER}}\` |"
+              echo "| 推送镜像数 | ${GHCR_PUSHED_COUNT:-?} |"
+              echo ""
+
+              if [[ -f "$GHCR_PUSHED_FILE" && -s "$GHCR_PUSHED_FILE" ]]; then
+                echo "#### 镜像清单（本地 → GHCR）"
+                echo ""
+                echo "| 本地镜像 | GHCR 镜像 |"
+                echo "|---|---|"
+                while IFS=$'\t' read -r src dst; do
+                  [[ -z "$src" ]] && continue
+                  echo "| \`${src}\` | \`${dst}\` |"
+                done < "$GHCR_PUSHED_FILE"
+                echo ""
+              fi
+
+              echo "#### 如何拉取"
+              echo ""
+              echo "> 若目标仓库/包为**私有**，拉取前需先登录；公开包可直接拉取，无需登录。"
+              echo ""
+              echo '```bash'
+              echo "# 1. 登录 GHCR（仅私有包需要；密码使用具备 read:packages 权限的 PAT）"
+              echo "echo \"<YOUR_PAT>\" | docker login ${GHCR_REGISTRY} -u <YOUR_GITHUB_USERNAME> --password-stdin"
+              echo ""
+              echo "# 2. 拉取镜像（完整镜像名见上方清单）"
+              echo "docker pull ${GHCR_NAMESPACE:-${GHCR_REGISTRY}/${GHCR_OWNER_LOWER}/${REPO_NAME_LOWER}}/<镜像名>:<tag>"
+              echo '```'
+              echo ""
+              echo "#### 国内加速代理直连 GHCR"
+              echo ""
+              echo "国内网络直连 \`ghcr.io\` 可能较慢，可将镜像地址中的域名 \`ghcr.io\` 替换为下列任一加速代理（镜像名其余部分保持不变），即可直连拉取："
+              echo ""
+              echo "| 加速代理 | 域名 |"
+              echo "|---|---|"
+              echo "| 南京大学镜像 | \`ghcr.nju.edu.cn\` |"
+              echo "| 毫秒镜像 | \`ghcr.1ms.run\` |"
+              echo ""
+              echo "示例（以下以清单中第一个镜像为例）："
+              echo ""
+              echo '```bash'
+              FIRST_DST="$(head -n 1 "$GHCR_PUSHED_FILE" 2>/dev/null | cut -f2 || true)"
+              if [[ -n "$FIRST_DST" ]]; then
+                PROXY_PATH="${FIRST_DST#${GHCR_REGISTRY}/}"
+                echo "docker pull ghcr.nju.edu.cn/${PROXY_PATH}"
+                echo "docker pull ghcr.1ms.run/${PROXY_PATH}"
+              else
+                echo "docker pull ghcr.nju.edu.cn/<owner>/<repo>/<镜像名>:<tag>"
+                echo "docker pull ghcr.1ms.run/<owner>/<repo>/<镜像名>:<tag>"
+              fi
+              echo '```'
+            else
+              echo "### ⚠️ 本次运行未产生预期结果"
+              echo ""
+              echo "运行状态：\`${JOB_STATUS}\`（交付方式：\`${DELIVERY_MODE}\`）。请查看上方失败步骤的日志定位原因，常见问题："
               echo ""
               echo "- 参数校验失败 → 检查 repo_url 地址格式、image_name 是否为 name:tag 形式"
               echo "- 克隆失败 → 检查仓库地址；私有仓库需配置 \`CLONE_PAT\` secret"
               echo "- 构建失败 → 检查 Dockerfile 及其依赖的网络资源；arm64 构建较慢属正常现象"
               echo "- 拉取失败 → 检查镜像名拼写、目标架构支持；私有镜像仓库需配置登录 secrets"
+              if [[ "$DELIVERY_MODE" == "push" ]]; then
+                echo "- 推送失败 → 检查 workflow 是否具备 \`packages: write\` 权限、GHCR 登录是否成功"
+              else
+                echo "- 打包失败 → 检查镜像架构校验是否通过、磁盘空间是否充足"
+              fi
               echo ""
               echo "更多排查指引见仓库 README 的 **FAQ 与故障排查** 章节。"
             fi
@@ -750,11 +939,18 @@ jobs:
 
       # ---------------------------------------------------------------
       # Step 12: 登出镜像仓库（若曾登录，尽力而为）
+      #   含 GHCR（delivery_mode=push）与自定义私有镜像仓库（REGISTRY_* secrets）
       # ---------------------------------------------------------------
       - name: 登出镜像仓库
-        if: ${{ always() && env.REGISTRY_LOGGED_IN == '1' }}
+        if: ${{ always() && (env.REGISTRY_LOGGED_IN == '1' || env.GHCR_LOGGED_IN == '1') }}
         continue-on-error: true
-        run: docker logout || true
+        run: |
+          if [[ "${GHCR_LOGGED_IN:-}" == "1" ]]; then
+            docker logout "$GHCR_REGISTRY" || true
+          fi
+          if [[ "${REGISTRY_LOGGED_IN:-}" == "1" ]]; then
+            docker logout || true
+          fi
 
       # ---------------------------------------------------------------
       # Step 13: 清理 Docker 缓存（尽力而为，失败不影响结果）
