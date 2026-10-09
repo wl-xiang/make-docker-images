@@ -272,13 +272,72 @@ A: 该服务可能配置在 Compose `profiles` 下且未默认激活。`docker c
 **Q: Artifact 在哪下载？**
 A: 运行详情页 → 底部 **Artifacts** 区域，点击文件名即可下载。注意保留期为 14 天，过期自动删除。
 
+## 运行历史清理 Workflow
+
+本仓库另提供一个**仅手动触发**的 workflow —— **Clean Workflow Run History**（[.github/workflows/cleanup-run-history.yml](.github/workflows/cleanup-run-history.yml)），用于按规则自动清理本仓库 workflow 的运行历史（删除整条 run，含其日志与 Artifact），释放 Actions 存储空间。
+
+### 使用步骤
+
+1. 进入本仓库的 GitHub 页面 → **Actions** 标签页
+2. 左侧选择 **Clean Workflow Run History**
+3. 点击 **Run workflow**，填写参数后运行
+4. **默认处于「预演模式」**：只打印将被删除的记录、不真正删除。先看运行页面的 **Summary** 确认清单无误
+5. 确认后再次触发，将 `dry_run` 设为 `false`，才会真正删除
+
+### 输入参数说明
+
+| 参数名 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `clean_by` | choice | `num` | 清理依据：`num` = 按保留条数；`date` = 按保留天数 |
+| `keep_count` | string | `10` | 保留最近 N 条运行记录（仅 `clean_by=num` 生效），须为正整数 |
+| `keep_days` | string | `30` | 保留最近 N 天内「已完成」的运行记录，更早的删除（仅 `clean_by=date` 生效），须为正整数 |
+| `dry_run` | boolean | `true` | 预演模式：`true` 只打印将删除的记录、不删除；`false` 真正删除 |
+
+### 清理规则
+
+- **`clean_by=num`**：按创建时间倒序，保留最近 `keep_count` 条记录；更早且状态为 `completed` 的记录被删除
+- **`clean_by=date`**：删除状态为 `completed` 且完成时间（`updated_at`）早于「当前时间 − `keep_days` 天」的记录
+
+### 安全策略
+
+- **永不删除** 处于 `queued` / `in_progress` 的记录（含当前运行）
+- **永不删除本 workflow 自身**的运行记录（也不参与保留计数）
+- 默认 `dry_run=true`，首次运行零风险
+- 删除**不可恢复**：删除 run 会同时删除其日志与 Artifact
+
+### 前置条件
+
+- 需要 `GITHUB_TOKEN` 具备 `actions: write` 权限（workflow 已声明 `permissions: actions: write`）。若组织/仓库限制了默认令牌权限，需在 **Settings → Actions → General → Workflow permissions** 中允许写入，或改用具备 `actions: write` 的 PAT
+- 依赖 runner 预装的 `gh` CLI（`ubuntu-latest` 自带，无需额外安装）
+
+### 用法示例
+
+**示例一：保留最近 10 条（默认，先预演）**
+
+```
+clean_by    = num
+keep_count  = 10
+dry_run     = true       # 预演：只输出将删除的清单
+```
+
+确认清单无误后，将 `dry_run` 改为 `false` 重新触发即可真正清理。
+
+**示例二：只保留最近 30 天内完成的历史**
+
+```
+clean_by    = date
+keep_days   = 30
+dry_run     = false
+```
+
 ## 本仓库结构
 
 ```
 .
 ├── .github/
 │   └── workflows/
-│       └── build-and-package-images.yml   # Workflow 主文件
+│       ├── build-and-package-images.yml   # 镜像构建打包 Workflow 主文件
+│       └── cleanup-run-history.yml        # 运行历史清理 Workflow（手动触发）
 ├── .gitignore
 ├── DESIGN.md                              # 设计文档
 └── README.md
