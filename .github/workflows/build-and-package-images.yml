@@ -39,7 +39,7 @@ on:
         description: '镜像获取模式：docker build = 从 Dockerfile 构建；compose pull = 从 Compose 拉取；compose auto = 按 Compose 服务自动构建/拉取'
         required: true
         type: choice
-        default: docker build
+        default: compose auto
         options:
           - docker build
           - compose pull
@@ -347,8 +347,22 @@ jobs:
           # Compose 文件存在性检查（为空时使用默认值）
           COMPOSE_FILE_PATH="${COMPOSE_FILE_PATH:-docker-compose.yml}"
           if [[ ! -f "$COMPOSE_FILE_PATH" ]]; then
-            echo "::error::未找到 Compose 文件：$COMPOSE_FILE_PATH（路径相对于目标仓库根目录）"
-            exit 1
+            # 扩展名回退：.yml 与 .yaml 自动互查（用户给了 .yml 就找 .yaml，反之亦然）
+            ALT_PATH=""
+            case "$COMPOSE_FILE_PATH" in
+              *.yml)  ALT_PATH="${COMPOSE_FILE_PATH%.yml}.yaml" ;;
+              *.yaml) ALT_PATH="${COMPOSE_FILE_PATH%.yaml}.yml" ;;
+            esac
+            if [[ -n "$ALT_PATH" && -f "$ALT_PATH" ]]; then
+              echo "ℹ️ 未找到 $COMPOSE_FILE_PATH，已自动改用 $ALT_PATH"
+              COMPOSE_FILE_PATH="$ALT_PATH"
+            else
+              echo "::error::未找到 Compose 文件：$COMPOSE_FILE_PATH（路径相对于目标仓库根目录）"
+              if [[ -n "$ALT_PATH" ]]; then
+                echo "已扫描 .yml 与 .yaml 两种扩展名，均不存在：$COMPOSE_FILE_PATH / $ALT_PATH"
+              fi
+              exit 1
+            fi
           fi
 
           # 解析 Compose 文件（格式错误、引用了未定义的环境变量等会在这里失败）
@@ -416,8 +430,22 @@ jobs:
           # Compose 文件存在性检查（为空时使用默认值）
           COMPOSE_FILE_PATH="${COMPOSE_FILE_PATH:-docker-compose.yml}"
           if [[ ! -f "$COMPOSE_FILE_PATH" ]]; then
-            echo "::error::未找到 Compose 文件：$COMPOSE_FILE_PATH（路径相对于目标仓库根目录）"
-            exit 1
+            # 扩展名回退：.yml 与 .yaml 自动互查（用户给了 .yml 就找 .yaml，反之亦然）
+            ALT_PATH=""
+            case "$COMPOSE_FILE_PATH" in
+              *.yml)  ALT_PATH="${COMPOSE_FILE_PATH%.yml}.yaml" ;;
+              *.yaml) ALT_PATH="${COMPOSE_FILE_PATH%.yaml}.yml" ;;
+            esac
+            if [[ -n "$ALT_PATH" && -f "$ALT_PATH" ]]; then
+              echo "ℹ️ 未找到 $COMPOSE_FILE_PATH，已自动改用 $ALT_PATH"
+              COMPOSE_FILE_PATH="$ALT_PATH"
+            else
+              echo "::error::未找到 Compose 文件：$COMPOSE_FILE_PATH（路径相对于目标仓库根目录）"
+              if [[ -n "$ALT_PATH" ]]; then
+                echo "已扫描 .yml 与 .yaml 两种扩展名，均不存在：$COMPOSE_FILE_PATH / $ALT_PATH"
+              fi
+              exit 1
+            fi
           fi
 
           # 目标仓库名（用于 Compose 项目名，保证构建型镜像名可预期）
