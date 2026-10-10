@@ -18,9 +18,9 @@
           ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
 │  获取镜像（三选一）                                                          │
-│  mode=docker build : docker buildx build --platform ... -t <image_name>    │
-│  mode=compose pull : 解析 Compose，逐个 docker pull --platform 全部镜像       │
-│  mode=compose auto : 声明 image: 的服务拉取；仅声明 build:（无 image:）的构建  │
+│  build_mode=docker build : docker buildx build --platform ... -t <image_name>│
+│  build_mode=compose pull : 解析 Compose，逐个 docker pull --platform 全部镜像  │
+│  build_mode=compose auto : 声明 build: 的服务构建；仅声明 image: 的拉取        │
 └─────────┬─────────────────────────────────────────────────────────────────┘
           ▼
 ┌─────────────────────┐
@@ -52,13 +52,13 @@
 |---|---|---|---|---|
 | `repo_url` | string | ✅ | 无 | 目标仓库克隆链接，如 `https://github.com/wl-xiang/code-server-ai.git` |
 | `platform` | choice | ✅ | `linux/amd64` | 目标部署平台：`linux/amd64` 或 `linux/arm64` |
-| `mode` | choice | ✅ | `docker build` | 镜像获取模式，三选一：`docker build` / `compose pull` / `compose auto` |
-| `dockerfile_path` | string | ❌ | `Dockerfile` | Dockerfile 路径（相对目标仓库根目录），仅 `mode=docker build` 生效 |
-| `compose_file_path` | string | ❌ | `docker-compose.yml` | Compose 文件路径，仅 `mode=compose pull` / `compose auto` 生效 |
+| `build_mode` | choice | ✅ | `docker build` | 镜像获取模式，三选一：`docker build` / `compose pull` / `compose auto` |
+| `dockerfile_path` | string | ❌ | `Dockerfile` | Dockerfile 路径（相对目标仓库根目录），仅 `build_mode=docker build` 生效 |
+| `compose_file_path` | string | ❌ | `docker-compose.yml` | Compose 文件路径，仅 `build_mode=compose pull` / `compose auto` 生效 |
 | `env_file_dir` | string | ❌ | 空 | 环境变量文件所在目录，留空表示项目根目录（存在 `.env.example` 时自动复制为 `.env`） |
 | `force_env` | boolean | ❌ | `false` | 是否强制在目标路径生成一个空的 `.env` 文件（仅当该位置不存在 `.env` 时创建） |
 | `env_path` | string | ❌ | 空 | `.env` 文件生成目录（相对目标仓库根目录），留空表示项目根目录；仅 `force_env=true` 时生效 |
-| `image_name` | string | ⚠️ 条件必填 | 空 | 镜像名称:tag，如 `myimg:latest`，仅 `mode=docker build` 时使用 |
+| `image_name` | string | ⚠️ 条件必填 | 空 | 镜像名称:tag，如 `myimg:latest`，仅 `build_mode=docker build` 时使用 |
 
 **模式说明**：
 
@@ -66,14 +66,16 @@
 |---|---|---|
 | `docker build` | 用 `docker buildx build` 从单个 Dockerfile 构建 1 个镜像 | 目标仓库有单一 Dockerfile |
 | `compose pull` | 解析 Compose 文件，逐个 `docker pull` 其全部镜像；若存在 `build:` 型服务则报错 | Compose 中所有服务都已声明 `image:` |
-| `compose auto` | 解析 Compose 文件：声明 `image:` 的服务拉取；仅声明 `build:`（无 `image:`）的服务用 Compose 自动构建 | Compose 中混合了「拉取」与「构建」型服务 |
+| `compose auto` | 解析 Compose 文件：声明 `build:` 的服务（即使同时声明 `image:`）用 Compose 构建；仅声明 `image:`（无 `build:`）的服务拉取 | Compose 中混合了「拉取」与「构建」型服务 |
 
-> `compose auto` 中，构建型镜像由 Compose 按 `<project>-<service>` 命名；项目名优先取 Compose 文件顶层 `name:`，否则取目标仓库名（不会落到克隆目录名 `target-repo`）。
+> `compose auto` 中，构建型镜像若声明了 `image:` 则按该值命名，否则由 Compose 按 `<project>-<service>` 命名；项目名优先取 Compose 文件顶层 `name:`，否则取目标仓库名（不会落到克隆目录名 `target-repo`）。
+
+> 说明：服务同时声明 `build:` 与 `image:`（Compose 语义为「本地已构建的镜像优先复用，否则拉取」）时，云端无法保证该 `image` 已存在于 registry，因此 `compose auto` 统一按构建处理。
 
 **参数校验规则**（校验不通过会立即终止）：
 
 1. `image_name` 必须包含冒号 `:` 且仅一个（格式 `name:tag`）
-2. `mode=docker build` 时 `image_name` 可选（留空默认 `<repo_name>:latest`），填写时须符合 `name:tag`；`compose pull` / `compose auto` 时忽略
+2. `build_mode=docker build` 时 `image_name` 可选（留空默认 `<repo_name>:latest`），填写时须符合 `name:tag`；`compose pull` / `compose auto` 时忽略
 3. `repo_url` 必须是合法的 `https://github.com/<owner>/<repo>` 地址
 4. 所有路径参数（`dockerfile_path` / `compose_file_path` / `env_file_dir` / `env_path`）必须为相对路径且不得包含 `..`
 
@@ -86,7 +88,7 @@
 ```
 repo_url         = https://github.com/user/some-repo.git
 platform         = linux/amd64
-mode             = docker build
+build_mode       = docker build
 dockerfile_path  = Dockerfile          （可留空使用默认值）
 image_name       = myimg:latest
 ```
@@ -98,7 +100,7 @@ image_name       = myimg:latest
 ```
 repo_url         = https://github.com/user/some-repo.git
 platform         = linux/arm64
-mode             = docker build
+build_mode       = docker build
 dockerfile_path  = docker/app/Dockerfile
 image_name       = myimg:1.0.0
 ```
@@ -112,7 +114,7 @@ Runner 本身是 x86，workflow 会通过 **QEMU** 自动模拟 ARM 环境完成
 ```
 repo_url            = https://github.com/user/some-repo.git
 platform            = linux/amd64
-mode                = compose pull
+build_mode          = compose pull
 compose_file_path   = docker-compose.yml （可留空使用默认值）
 ```
 
@@ -125,32 +127,33 @@ workflow 会：
 
 ### 示例四：compose auto 模式（自动区分构建 / 拉取）
 
-目标仓库的 Compose 中既有声明 `image:` 的服务、又有仅声明 `build:` 的服务（典型如：`backend` / `worker` 由源码构建，`db` / `redis` 直接用官方镜像）：
+目标仓库的 Compose 中既有声明 `image:` 的服务、又有声明 `build:` 的服务（典型如：`backend` / `worker` 由源码构建，`db` / `redis` 直接用官方镜像）：
 
 ```yaml
 services:
   backend:
     build: ./backend          # 仅 build，无 image → 自动构建
   worker:
-    build: ./worker           # 仅 build，无 image → 自动构建
+    build: ./worker
+    image: myapp/worker:1.0   # build 与 image 同时存在 → 仍按构建处理（构建后按此 image 命名）
   db:
-    image: postgres:16        # 有 image → 直接拉取
+    image: postgres:16        # 仅 image → 直接拉取
   redis:
-    image: redis:7            # 有 image → 直接拉取
+    image: redis:7            # 仅 image → 直接拉取
 ```
 
 ```
 repo_url            = https://github.com/user/some-repo.git
 platform            = linux/amd64
-mode                = compose auto
+build_mode          = compose auto
 compose_file_path   = docker-compose.yml （可留空使用默认值）
 ```
 
 workflow 会：
 
-1. 解析 Compose 文件，把服务分为两类：声明 `image:` 的（拉取）与仅声明 `build:` 的（构建）
+1. 解析 Compose 文件，把服务分为两类：声明 `build:` 的（构建，即使同时声明 `image:`）与仅声明 `image:` 的（拉取）
 2. 对拉取型服务逐个 `docker pull --platform <platform>`
-3. 对构建型服务执行 `docker compose build`（Compose 自动处理 `context` / `dockerfile` / `args` / `target`），并按 `<project>-<service>` 命名
+3. 对构建型服务执行 `docker compose build`（Compose 自动处理 `context` / `dockerfile` / `args` / `target`）；声明了 `image:` 的构建型服务按该值命名，否则按 `<project>-<service>` 命名
 4. 合并两类镜像，一次性 `docker save` 到同一个 TGZ
 
 > 若目标服务器在 `docker compose up` 时要复用这些构建型镜像，请确保其 Compose 项目名与本 workflow 一致（本 workflow 在 Compose 文件未声明顶层 `name:` 时使用目标仓库名作为项目名）。
@@ -162,7 +165,7 @@ workflow 会：
 ```
 repo_url   = https://github.com/user/some-repo.git
 platform   = linux/amd64
-mode       = compose auto
+build_mode = compose auto
 force_env  = true
 env_path   =            （留空表示目标仓库根目录；也可填子目录，如 app）
 ```
@@ -183,7 +186,7 @@ env_path   =            （留空表示目标仓库根目录；也可填子目�
 - `<yyyymmdd-HHMMSS>`：打包时的北京时间戳
 - `docker build` 模式：包含 1 个镜像
 - `compose pull` 模式：包含 Compose 文件中声明的全部 `image:` 镜像
-- `compose auto` 模式：包含 Compose 中拉取的镜像 + 构建型服务（`<project>-<service>`）的镜像
+- `compose auto` 模式：包含 Compose 中拉取的镜像 + 构建型服务的镜像（声明了 `image:` 者按该值，否则为 `<project>-<service>`）
 - Artifact 保留 14 天；不同运行通过时间戳区分，互不覆盖
 - 打包后会自动**校验每个镜像的架构**与目标平台一致，防止拉错/构建错架构的镜像混入离线包
 - Summary 中会记录 TGZ 的 **SHA256** 哈希，供传输后校验完整性
@@ -234,7 +237,7 @@ docker images
 ## FAQ 与故障排查
 
 **Q: 运行报错 `image_name 必须包含冒号`？**
-A: `mode=docker build` 时若填写了 `image_name`，必须写成 `名称:tag` 的完整形式（如 `myimg:latest`），不能只写名称；留空则默认 `<repo_name>:latest`。
+A: `build_mode=docker build` 时若填写了 `image_name`，必须写成 `名称:tag` 的完整形式（如 `myimg:latest`），不能只写名称；留空则默认 `<repo_name>:latest`。
 
 **Q: 报错 `克隆失败`？**
 A: 依次检查：① 仓库地址拼写是否正确；② 仓库是否真实存在；③ 私有仓库是否已配置 `CLONE_PAT` secret。
@@ -252,10 +255,10 @@ A: 本 workflow 已用 `docker pull --platform` 强制拉取指定架构。若�
 A: Compose 文件中引用了未定义的环境变量（如 `${DB_PASSWORD}`）会导致解析失败。目标仓库需自带 `.env`、提供默认值，或开启 `force_env=true` 生成空 `.env`。
 
 **Q: 报错 `存在 build 型服务`？**
-A: 该报错来自 `compose pull` 模式：Compose 中有服务声明了 `build:` 字段，而 `compose pull` 只负责拉取镜像、不执行构建。请任选其一：① 改用 `compose auto` 模式（声明 `image:` 的服务拉取、仅声明 `build:` 的服务自动构建）；② 为这些服务补充 `image:` 字段（指向 registry 中已有的镜像）；③ 改用 `docker build` 模式（单一 Dockerfile）。
+A: 该报错来自 `compose pull` 模式：Compose 中有服务声明了 `build:` 字段，而 `compose pull` 只负责拉取镜像、不执行构建。请任选其一：① 改用 `compose auto` 模式（声明 `build:` 的服务自动构建、仅声明 `image:` 的服务拉取）；② 为这些服务补充 `image:` 字段（指向 registry 中已有的镜像）；③ 改用 `docker build` 模式（单一 Dockerfile）。
 
 **Q: `compose auto` 构建出来的镜像叫什么名字？导入后能直接被 Compose 使用吗？**
-A: 构建型镜像由 Compose 按 `<project>-<service>` 命名。若 Compose 文件声明了顶层 `name:` 则以它为准，否则本 workflow 使用目标仓库名作为项目名。请确保目标服务器上 `docker compose up` 的项目名与之相同，导入的镜像才能被直接复用（否则 Compose 会尝试重新构建/拉取）。
+A: 构建型服务若声明了 `image:`，构建后镜像即按该值命名；否则由 Compose 按 `<project>-<service>` 命名。若 Compose 文件声明了顶层 `name:` 则以它为准，否则本 workflow 使用目标仓库名作为项目名。请确保目标服务器上 `docker compose up` 的项目名与之相同，导入的镜像才能被直接复用（否则 Compose 会尝试重新构建/拉取）。
 
 **Q: `force_env=true` 但目标目录已有 `.env`？**
 A: 会跳过、不覆盖已有 `.env`，只在目标位置不存在 `.env` 时生成一个空文件。
