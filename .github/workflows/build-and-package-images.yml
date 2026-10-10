@@ -84,7 +84,7 @@ on:
         default: ''
         type: string
       image_name:
-        description: '镜像名称与 tag（仅 build_mode=docker build 生效），例如 myimg:latest。留空则默认使用 <repo_name>:latest（repo_name 取自 repo_url 的项目名）'
+        description: '镜像名称与 tag（仅 build_mode=docker build 生效），例如 myimg:latest。留空则默认使用 <repo_name>:latest（platform=linux/arm64 时为 <repo_name>:latest-arm；repo_name 取自 repo_url 的项目名）'
         required: false
         default: ''
         type: string
@@ -155,8 +155,8 @@ jobs:
           # -- 3. 模式联动校验 --
           if [[ "$BUILD_MODE" == "docker build" ]]; then
             if [[ -z "${IMAGE_NAME// /}" ]]; then
-              # 留空时构建阶段将默认使用 <repo_name>:latest，此处跳过格式校验
-              echo "build_mode=docker build：未填写 image_name，构建时将默认使用 <repo_name>:latest"
+              # 留空时构建阶段将默认使用 <repo_name>:<默认tag>（arm64 为 latest-arm），此处跳过格式校验
+              echo "build_mode=docker build：未填写 image_name，构建时将默认使用 <repo_name>:latest（platform=linux/arm64 时为 <repo_name>:latest-arm）"
             else
               if [[ "$IMAGE_NAME" != *:* ]]; then
                 fail "image_name 必须包含冒号 ':'（即必须显式指定 tag，格式 name:tag），当前值：$IMAGE_NAME"
@@ -319,7 +319,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # image_name 留空时，默认使用 <repo_name>:latest（repo_name 取自 repo_url 的项目名）
+          # image_name 留空时，默认使用 <repo_name>:<默认tag>（repo_name 取自 repo_url 的项目名）
+          # linux/arm64 平台默认 tag 为 latest-arm，其余平台为 latest
+          DEFAULT_TAG="latest"
+          if [[ "$PLATFORM" == "linux/arm64" ]]; then
+            DEFAULT_TAG="latest-arm"
+          fi
           if [[ -z "${IMAGE_NAME// /}" ]]; then
             REPO_NAME="${REPO_URL%/}"
             REPO_NAME="${REPO_NAME%.git}"
@@ -329,8 +334,8 @@ jobs:
               echo "::error::image_name 留空且无法从 repo_url 解析出项目名：$REPO_URL"
               exit 1
             fi
-            IMAGE_NAME="${REPO_NAME}:latest"
-            echo "ℹ️ 未填写 image_name，已使用默认值：$IMAGE_NAME"
+            IMAGE_NAME="${REPO_NAME}:${DEFAULT_TAG}"
+            echo "ℹ️ 未填写 image_name，已使用默认值：$IMAGE_NAME（platform=$PLATFORM，默认 tag=$DEFAULT_TAG）"
           fi
           echo "IMAGE_NAME=$IMAGE_NAME" >> "$GITHUB_ENV"
 
