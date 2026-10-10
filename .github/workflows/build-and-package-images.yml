@@ -3,11 +3,11 @@
 #
 # 完整链路：Git Clone 用户仓库 → 构建或拉取 Docker 镜像 → 打包产出 TGZ Artifact 或推送到 GHCR
 #
-# 三种获取模式（mode）：
+# 三种获取模式（build_mode）：
 #   docker build : 从用户仓库的 Dockerfile 构建镜像（支持跨平台，QEMU 模拟）
 #   compose pull : 解析用户仓库的 Compose 文件，拉取其中定义的全部镜像（服务必须声明 image:）
-#   compose auto : 解析 Compose 文件，按服务自动处理 —— 声明 image: 则拉取，
-#                  仅声明 build:（无 image:）则用 Compose 构建该服务镜像
+#   compose auto : 解析 Compose 文件，按服务自动处理 —— 声明 build: 则用 Compose 构建该服务镜像
+#                  （即使同时声明 image: 也按构建处理），仅声明 image:（无 build:）则拉取
 #
 # 两种交付方式（delivery_mode）：
 #   pack : 将全部镜像 docker save 并压缩为 TGZ，上传到 Artifacts（默认）
@@ -41,7 +41,7 @@ on:
         options:
           - linux/amd64
           - linux/arm64
-      mode:
+      build_mode:
         description: '镜像获取模式：docker build = 从 Dockerfile 构建；compose pull = 从 Compose 拉取；compose auto = 按 Compose 服务自动构建/拉取'
         required: true
         type: choice
@@ -59,12 +59,12 @@ on:
           - pack
           - push
       dockerfile_path:
-        description: 'Dockerfile 路径（仅 mode=docker build 生效）。根目录填 Dockerfile，子目录填 path/to/Dockerfile'
+        description: 'Dockerfile 路径（仅 build_mode=docker build 生效）。根目录填 Dockerfile，子目录填 path/to/Dockerfile'
         required: false
         default: 'Dockerfile'
         type: string
       compose_file_path:
-        description: 'Docker Compose 文件路径（仅 mode=compose pull / compose auto 生效）'
+        description: 'Docker Compose 文件路径（仅 build_mode=compose pull / compose auto 生效）'
         required: false
         default: 'docker-compose.yml'
         type: string
@@ -84,7 +84,7 @@ on:
         default: ''
         type: string
       image_name:
-        description: '镜像名称与 tag（仅 mode=docker build 生效），例如 myimg:latest。留空则默认使用 <repo_name>:latest（repo_name 取自 repo_url 的项目名）'
+        description: '镜像名称与 tag（仅 build_mode=docker build 生效），例如 myimg:latest。留空则默认使用 <repo_name>:latest（repo_name 取自 repo_url 的项目名）'
         required: false
         default: ''
         type: string
@@ -125,7 +125,7 @@ jobs:
         env:
           REPO_URL: ${{ inputs.repo_url }}
           PLATFORM: ${{ inputs.platform }}
-          MODE: ${{ inputs.mode }}
+          BUILD_MODE: ${{ inputs.build_mode }}
           DELIVERY_MODE: ${{ inputs.delivery_mode }}
           DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
           COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
@@ -153,10 +153,10 @@ jobs:
           done
 
           # -- 3. 模式联动校验 --
-          if [[ "$MODE" == "docker build" ]]; then
+          if [[ "$BUILD_MODE" == "docker build" ]]; then
             if [[ -z "${IMAGE_NAME// /}" ]]; then
               # 留空时构建阶段将默认使用 <repo_name>:latest，此处跳过格式校验
-              echo "mode=docker build：未填写 image_name，构建时将默认使用 <repo_name>:latest"
+              echo "build_mode=docker build：未填写 image_name，构建时将默认使用 <repo_name>:latest"
             else
               if [[ "$IMAGE_NAME" != *:* ]]; then
                 fail "image_name 必须包含冒号 ':'（即必须显式指定 tag，格式 name:tag），当前值：$IMAGE_NAME"
@@ -181,7 +181,7 @@ jobs:
               fi
             fi
           else
-            echo "mode=$MODE：image_name 将被忽略（镜像列表由 Compose 文件决定）"
+            echo "build_mode=$BUILD_MODE：image_name 将被忽略（镜像列表由 Compose 文件决定）"
           fi
 
           # -- 4. 交付方式校验 --
@@ -189,7 +189,7 @@ jobs:
             fail "delivery_mode 取值非法（当前值：$DELIVERY_MODE），只允许 pack 或 push"
           fi
 
-          echo "✅ 输入参数校验通过（mode=$MODE，delivery_mode=$DELIVERY_MODE，platform=$PLATFORM）"
+          echo "✅ 输入参数校验通过（build_mode=$BUILD_MODE，delivery_mode=$DELIVERY_MODE，platform=$PLATFORM）"
 
       # ---------------------------------------------------------------
       # Step 3: 浅克隆用户目标仓库
@@ -308,8 +308,8 @@ jobs:
       #   注意：setup-buildx 之后默认构建器为 docker-container 驱动，
       #   构建结果不会自动进入本地镜像库，必须显式 --load 才能 docker save
       # ---------------------------------------------------------------
-      - name: 构建镜像（mode=docker build）
-        if: ${{ inputs.mode == 'docker build' }}
+      - name: 构建镜像（build_mode=docker build）
+        if: ${{ inputs.build_mode == 'docker build' }}
         working-directory: target-repo
         env:
           REPO_URL: ${{ inputs.repo_url }}
@@ -362,8 +362,8 @@ jobs:
       #   不启动任何容器：先解析 Compose 得到镜像清单，
       #   再逐个以 --platform 强制拉取目标架构，避免拉到 Runner 默认架构
       # ---------------------------------------------------------------
-      - name: 拉取 Compose 镜像（mode=compose pull）
-        if: ${{ inputs.mode == 'compose pull' }}
+      - name: 拉取 Compose 镜像（build_mode=compose pull）
+        if: ${{ inputs.build_mode == 'compose pull' }}
         working-directory: target-repo
         env:
           COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
@@ -438,14 +438,17 @@ jobs:
 
       # ---------------------------------------------------------------
       # Step 7C: 模式 compose auto —— 按 Compose 服务自动「拉取 / 构建」
-      #   规则：服务声明了 image:            → 拉取该镜像
-      #         服务仅声明 build:（无 image:）→ 用 Compose 构建该服务镜像
-      #   构建型镜像由 Compose 按 <project>-<service> 命名；项目名优先取
-      #   Compose 文件顶层 name:，否则取目标仓库名（避免默认落到克隆目录名
-      #   target-repo），保证离线导入到目标服务器后镜像名可预期。
+      #   规则：服务声明了 build:                     → 用 Compose 构建该服务镜像
+      #         （即使同时声明 image: 也按构建处理 —— 本地已构建的镜像应优先复用，
+      #          云端无法保证该 image 已存在于 registry，故统一按 build 处理）
+      #         服务仅声明 image:（无 build:）          → 拉取该镜像
+      #   构建型镜像命名：服务声明了 image: 则用该值，否则由 Compose 按
+      #   <project>-<service> 命名；项目名优先取 Compose 文件顶层 name:，
+      #   否则取目标仓库名（避免默认落到克隆目录名 target-repo），
+      #   保证离线导入到目标服务器后镜像名可预期。
       # ---------------------------------------------------------------
-      - name: 自动构建/拉取 Compose 镜像（mode=compose auto）
-        if: ${{ inputs.mode == 'compose auto' }}
+      - name: 自动构建/拉取 Compose 镜像（build_mode=compose auto）
+        if: ${{ inputs.build_mode == 'compose auto' }}
         working-directory: target-repo
         env:
           REPO_URL: ${{ inputs.repo_url }}
@@ -496,17 +499,18 @@ jobs:
           PROJECT_NAME="$(jq -r '.name // empty' <<<"$CONFIG_JSON")"
           PROJECT_NAME="${PROJECT_NAME:-$REPO_NAME}"
 
-          # 分类：声明 image: 的服务 → 拉取；仅声明 build:（无 image:）的服务 → 构建
-          mapfile -t PULL_IMAGES < <(jq -r '.services[] | select(.image != null) | .image' <<<"$CONFIG_JSON" | sort -u | grep -v '^$' || true)
-          mapfile -t BUILD_SVCS < <(jq -r '.services | to_entries[] | select(.value.build != null and (.value.image == null)) | .key' <<<"$CONFIG_JSON" | grep -v '^$' || true)
+          # 分类：声明 build: 的服务 → 构建（即使同时声明 image: 也按构建处理）；
+          #       仅声明 image:（无 build:）的服务 → 拉取
+          mapfile -t PULL_IMAGES < <(jq -r '.services[] | select(.image != null and .build == null) | .image' <<<"$CONFIG_JSON" | sort -u | grep -v '^$' || true)
+          mapfile -t BUILD_SVCS < <(jq -r '.services | to_entries[] | select(.value.build != null) | .key' <<<"$CONFIG_JSON" | grep -v '^$' || true)
 
           if [[ ${#PULL_IMAGES[@]} -eq 0 && ${#BUILD_SVCS[@]} -eq 0 ]]; then
             echo "::error::Compose 文件中未解析到任何镜像服务，请检查 services.*.image / services.*.build 配置"
             exit 1
           fi
 
-          echo "📥 拉取型服务镜像（声明了 image）：${PULL_IMAGES[*]:-无}"
-          echo "🔨 构建型服务（仅声明 build，无 image）：${BUILD_SVCS[*]:-无}"
+          echo "📥 拉取型服务镜像（仅声明 image，无 build）：${PULL_IMAGES[*]:-无}"
+          echo "🔨 构建型服务（声明了 build，含同时声明 image 的服务）：${BUILD_SVCS[*]:-无}"
 
           # 1) 拉取：逐个以 --platform 强制拉取目标架构
           for img in "${PULL_IMAGES[@]}"; do
@@ -518,7 +522,8 @@ jobs:
             fi
           done
 
-          # 2) 构建：交给 Compose 处理 context/dockerfile/args/target，并按 <project>-<service> 命名
+          # 2) 构建：交给 Compose 处理 context/dockerfile/args/target；
+          #    声明了 image: 的构建型服务按该值命名，否则按 <project>-<service> 命名
           if [[ ${#BUILD_SVCS[@]} -gt 0 ]]; then
             echo "🔨 开始构建构建型服务镜像（平台：$PLATFORM）：${BUILD_SVCS[*]}"
             if ! DOCKER_DEFAULT_PLATFORM="$PLATFORM" docker compose -f "$COMPOSE_FILE_PATH" build "${BUILD_SVCS[@]}"; then
@@ -527,12 +532,14 @@ jobs:
             fi
           fi
 
-          # 汇总镜像清单：拉取型用 image:，构建型用 <project>-<service>
+          # 汇总镜像清单：拉取型用 image:；构建型若声明了 image: 则用该值，
+          # 否则用 Compose 的 <project>-<service> 命名
           {
             printf '%s\n' "${PULL_IMAGES[@]}"
             for svc in "${BUILD_SVCS[@]}"; do
               [[ -z "$svc" ]] && continue
-              echo "${PROJECT_NAME}-${svc}"
+              svc_image="$(jq -r --arg s "$svc" '.services[$s].image // empty' <<<"$CONFIG_JSON")"
+              echo "${svc_image:-${PROJECT_NAME}-${svc}}"
             done
           } | grep -v '^[[:space:]]*$' | sort -u > "$GITHUB_WORKSPACE/$IMAGE_LIST_FILE"
 
@@ -767,7 +774,7 @@ jobs:
         env:
           REPO_URL: ${{ inputs.repo_url }}
           PLATFORM: ${{ inputs.platform }}
-          MODE: ${{ inputs.mode }}
+          BUILD_MODE: ${{ inputs.build_mode }}
           DELIVERY_MODE: ${{ inputs.delivery_mode }}
           DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
           COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
@@ -814,10 +821,10 @@ jobs:
             echo "| 运行编号 | #${RUN_NUMBER} |"
             echo "| 目标仓库 | \`${REPO_URL}\` |"
             echo "| GitHub Ripple Hotlink | <a href=\"${REPO_LINK}\" target=\"_blank\" rel=\"noopener noreferrer\">${REPO_LINK}</a> |"
-            echo "| 模式 | \`${MODE}\` |"
+            echo "| 模式 | \`${BUILD_MODE}\` |"
             echo "| 交付方式 | \`${DELIVERY_MODE}\` |"
             echo "| 目标平台 | \`${PLATFORM}\` |"
-            if [[ "$MODE" == "docker build" ]]; then
+            if [[ "$BUILD_MODE" == "docker build" ]]; then
               echo "| Dockerfile | \`${DOCKERFILE_PATH:-Dockerfile}\` |"
               echo "| 镜像名称 | \`${IMAGE_NAME}\` |"
             else
