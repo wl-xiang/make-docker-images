@@ -12,7 +12,8 @@
 # 两种交付方式（delivery_mode）：
 #   pack : 将全部镜像 docker save 并压缩为 TGZ，上传到 Artifacts（默认）
 #   push : 将全部镜像重新打标签为 ghcr.io/<owner>/<repo>/<镜像名>:<tag> 并推送到 GHCR；
-#          不再产出 Artifact，摘要中给出拉取命令与国内加速代理
+#          并生成 docker-compose-ghcr.yml（所有 image: 已替换为 GHCR 地址、build: 段已移除）
+#          上传为 Artifact（docker-compose-ghcr），摘要中给出拉取命令与国内加速代理
 #
 # 钩子命令（hook_command）：构建/拉取前在目标仓库根目录执行的自定义命令，
 #   用于项目自身的前置初始化（如 plane 需先执行 ./setup.sh 生成各服务 .env），
@@ -108,6 +109,8 @@ env:
   TARGET_DIR: target-repo
   # 镜像列表文件（build/pull 两个分支共同写入，导出/推送步骤统一消费）
   IMAGE_LIST_FILE: image-list.txt
+  # 服务→镜像映射文件（service<TAB>image，用于生成 GHCR 版 Compose 文件）
+  SERVICE_IMAGE_FILE: service-images.tsv
   # GHCR 相关常量（delivery_mode=push 时使用）
   GHCR_REGISTRY: ghcr.io
   GHCR_OWNER: ${{ github.repository_owner }}
@@ -408,6 +411,8 @@ jobs:
 
           # 记录镜像列表，供导出步骤统一消费
           echo "$IMAGE_NAME" > "$GITHUB_WORKSPACE/$IMAGE_LIST_FILE"
+          # 记录 服务→镜像 映射（docker build 视为单服务，服务名取仓库名），供 GHCR 版 Compose 生成步骤消费
+          printf '%s\t%s\n' "$REPO_NAME" "$IMAGE_NAME" > "$GITHUB_WORKSPACE/$SERVICE_IMAGE_FILE"
           echo "✅ 镜像构建完成：$IMAGE_NAME"
 
       # ---------------------------------------------------------------
@@ -501,6 +506,10 @@ jobs:
             echo "  3. 改用 docker build 模式（单一 Dockerfile）"
             exit 1
           fi
+
+          # 记录 服务→镜像 映射，供 GHCR 版 Compose 文件生成步骤消费
+          jq -r '.services | to_entries[] | select(.value.image != null) | "\(.key)\t\(.value.image)"' \
+            <<<"$CONFIG_JSON" > "$GITHUB_WORKSPACE/$SERVICE_IMAGE_FILE"
 
           # 解析 Compose 文件中定义的全部镜像
           if ! IMAGES=$(docker compose -f "$COMPOSE_FILE_PATH" config --images 2>/dev/null | sort -u); then
@@ -665,6 +674,15 @@ jobs:
             fi
           fi
 
+          # 记录 服务→镜像 映射（覆盖全部服务：构建型无 image: 的按 <project>-<service> 补齐），
+          # 供 GHCR 版 Compose 文件生成步骤消费
+          : > "$GITHUB_WORKSPACE/$SERVICE_IMAGE_FILE"
+          while IFS= read -r _svc; do
+            [[ -z "$_svc" ]] && continue
+            _svc_image="$(jq -r --arg s "$_svc" '.services[$s].image // empty' <<<"$CONFIG_JSON")"
+            printf '%s\t%s\n' "$_svc" "${_svc_image:-${PROJECT_NAME}-${_svc}}" >> "$GITHUB_WORKSPACE/$SERVICE_IMAGE_FILE"
+          done < <(jq -r '.services | keys[]' <<<"$CONFIG_JSON")
+
           # 汇总镜像清单：拉取型用 image:；构建型若声明了 image: 则用该值，
           # 否则用 Compose 的 <project>-<service> 命名
           {
@@ -810,6 +828,151 @@ jobs:
           echo "GHCR_NAMESPACE=$NAMESPACE" >> "$GITHUB_ENV"
           echo "GHCR_PUSHED_COUNT=${#IMAGES[@]}" >> "$GITHUB_ENV"
           echo "✅ 已推送 ${#IMAGES[@]} 个镜像到 $NAMESPACE/"
+
+      # ---------------------------------------------------------------
+      # Step 8D: 生成 GHCR 版 Compose 文件（仅 delivery_mode=push）
+      #   push 模式下镜像已重命名为 ghcr.io/<owner>/<repo>/... 前缀，
+      #   目标仓库自带的 Compose 文件仍指向原始镜像名（或 build: 段），
+      #   用户拿到后无法直接使用。本步骤基于「服务→本地镜像」映射与
+      #   「本地镜像→GHCR 目标名」推送记录，生成 docker-compose-ghcr.yml：
+      #     - 所有服务的 image: 替换为对应的 GHCR 镜像地址
+      #     - 移除 services.*.build 段（镜像已在 GHCR，无需再构建）
+      #   docker build 模式没有 Compose 文件，则生成仅含单服务的最小文件。
+      #   生成后会用 docker compose config 校验，确保交付文件可用。
+      # ---------------------------------------------------------------
+      - name: 生成 GHCR 版 Compose 文件（delivery_mode=push）
+        if: ${{ inputs.delivery_mode == 'push' }}
+        env:
+          BUILD_MODE: ${{ inputs.build_mode }}
+          COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
+          REPO_URL: ${{ inputs.repo_url }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PYEOF'
+          import os
+          import subprocess
+          import sys
+
+          try:
+              import yaml
+          except ImportError:  # runner 一般预装 PyYAML，兜底安装
+              subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "pyyaml"])
+              import yaml
+
+          ws = os.environ["GITHUB_WORKSPACE"]
+          svc_file = os.path.join(ws, os.environ["SERVICE_IMAGE_FILE"])
+          push_file = os.path.join(ws, os.environ["GHCR_PUSHED_FILE"])
+          build_mode = os.environ["BUILD_MODE"]
+          compose_input = (os.environ.get("COMPOSE_FILE_PATH") or "docker-compose.yml").strip() or "docker-compose.yml"
+          repo_url = os.environ["REPO_URL"]
+          target_dir = os.path.join(ws, "target-repo")
+          out_name = "docker-compose-ghcr.yml"
+          out_path = os.path.join(target_dir, out_name)
+
+          # 1) 服务 → 本地镜像
+          svc_img = {}
+          with open(svc_file, encoding="utf-8") as f:
+              for line in f:
+                  line = line.rstrip("\n")
+                  if not line or "\t" not in line:
+                      continue
+                  svc, img = line.split("\t", 1)
+                  svc_img[svc] = img
+
+          # 2) 本地镜像 → GHCR 目标名
+          img_ghcr = {}
+          with open(push_file, encoding="utf-8") as f:
+              for line in f:
+                  line = line.rstrip("\n")
+                  if not line or "\t" not in line:
+                      continue
+                  src, dst = line.split("\t", 1)
+                  img_ghcr[src] = dst
+
+          if not svc_img or not img_ghcr:
+              print("::error::服务→镜像映射或推送记录为空，无法生成 GHCR 版 Compose 文件")
+              sys.exit(1)
+
+          replaced, untouched = [], []
+          doc = None
+
+          if build_mode != "docker build":
+              # 3a) Compose 模式：读取原始 Compose 文件（与拉取步骤相同的 .yml/.yaml 回退逻辑）
+              cand = os.path.join(target_dir, compose_input)
+              if not os.path.isfile(cand):
+                  alt = compose_input[:-4] + (".yml" if compose_input.endswith(".yaml") else ".yaml")
+                  alt_path = os.path.join(target_dir, alt)
+                  if os.path.isfile(alt_path):
+                      cand = alt_path
+
+              if os.path.isfile(cand):
+                  with open(cand, encoding="utf-8") as f:
+                      doc = yaml.safe_load(f) or {}
+                  services = doc.get("services") or {}
+                  if not services:
+                      print("::error::原始 Compose 文件中未找到 services 定义：%s" % cand)
+                      sys.exit(1)
+                  for svc, node in services.items():
+                      if not isinstance(node, dict):
+                          continue
+                      # YAML 1.1 会把裸写的 no/yes/on/off 解析为布尔值，
+                      # 而 Compose 的 restart 要求字符串（如 restart: no），需还原
+                      rv = node.get("restart")
+                      if rv is False:
+                          node["restart"] = "no"
+                      elif rv is True:
+                          node["restart"] = "always"
+                      local = svc_img.get(svc)
+                      ghcr_name = img_ghcr.get(local) if local else None
+                      if ghcr_name:
+                          node["image"] = ghcr_name
+                          node.pop("build", None)
+                          replaced.append(svc)
+                      elif "build" in node:
+                          # 该服务镜像未出现在推送记录中，保留原样并告警
+                          untouched.append(svc)
+                      else:
+                          untouched.append(svc)
+
+          if doc is None:
+              # 3b) docker build 模式（或 Compose 文件缺失）：生成仅含单服务的最小文件
+              svc, local = next(iter(svc_img.items()))
+              ghcr_name = img_ghcr.get(local)
+              if not ghcr_name:
+                  print("::error::镜像 %s 未找到对应的 GHCR 推送记录" % local)
+                  sys.exit(1)
+              doc = {"services": {svc: {"image": ghcr_name}}}
+              replaced.append(svc)
+
+          # 4) 写出（保留键序，便于阅读 diff）
+          with open(out_path, "w", encoding="utf-8") as f:
+              yaml.safe_dump(doc, f, sort_keys=False, allow_unicode=True, default_flow_style=False)
+
+          print("已生成 %s" % out_path)
+          print("  已替换为 GHCR 地址的服务：%s" % (", ".join(replaced) or "无"))
+          if untouched:
+              print("  ⚠️ 未在推送记录中找到对应镜像、保留原样的服务：%s" % ", ".join(untouched))
+          PYEOF
+
+          # 5) 校验生成文件的 Compose 语法可解析（在 target-repo 内执行，env_file 相对路径才可解析）
+          if ! (cd target-repo && docker compose -f docker-compose-ghcr.yml config --quiet); then
+            echo "::error::生成的 docker-compose-ghcr.yml 校验失败"
+            echo "请检查上方 Compose 校验输出。注意：该文件引用的 env_file（如 .env）需与目标服务器上的实际目录结构一致"
+            exit 1
+          fi
+          echo "✅ docker-compose-ghcr.yml 生成并校验通过"
+          echo "--------------------------------------------------"
+          cat target-repo/docker-compose-ghcr.yml
+
+      - name: 上传 GHCR 版 Compose 文件（delivery_mode=push）
+        if: ${{ inputs.delivery_mode == 'push' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-compose-ghcr
+          path: target-repo/docker-compose-ghcr.yml
+          retention-days: 14
+          if-no-files-found: error
 
       # ---------------------------------------------------------------
       # Step 9: docker save 导出全部镜像，并压缩为 TGZ
@@ -1016,6 +1179,7 @@ jobs:
               echo "|---|---|"
               echo "| GHCR 命名空间 | \`${GHCR_NAMESPACE:-${GHCR_REGISTRY}/${GHCR_OWNER_LOWER}/${REPO_NAME_LOWER}}\` |"
               echo "| 推送镜像数 | ${GHCR_PUSHED_COUNT:-?} |"
+              echo "| Compose 文件 Artifact | \`docker-compose-ghcr\`（内含 docker-compose-ghcr.yml，image 已替换为 GHCR 地址） |"
               echo ""
 
               if [[ -f "$GHCR_PUSHED_FILE" && -s "$GHCR_PUSHED_FILE" ]]; then
@@ -1040,6 +1204,16 @@ jobs:
               echo ""
               echo "# 2. 拉取镜像（完整镜像名见上方清单）"
               echo "docker pull ${GHCR_NAMESPACE:-${GHCR_REGISTRY}/${GHCR_OWNER_LOWER}/${REPO_NAME_LOWER}}/<镜像名>:<tag>"
+              echo '```'
+              echo ""
+              echo "#### 一键使用 Compose 启动（无需手改镜像名）"
+              echo ""
+              echo "从本次运行页面的 **Artifacts** 区域下载 \`docker-compose-ghcr\`（解压得到 \`docker-compose-ghcr.yml\`），"
+              echo "其中所有服务的 \`image:\` 已替换为对应的 GHCR 镜像地址、\`build:\` 段已移除。"
+              echo "将其放到目标仓库的 Compose 文件同目录（env_file 引用的 .env 需按项目要求提前准备好），然后："
+              echo ""
+              echo '```bash'
+              echo "docker compose -f docker-compose-ghcr.yml up -d"
               echo '```'
               echo ""
               echo "#### 国内加速代理直连 GHCR"

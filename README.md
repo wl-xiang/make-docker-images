@@ -230,6 +230,25 @@ docker load -i <(gunzip -c code-server-ai_docker-images_linux-amd64_20261009-153
 docker images
 ```
 
+## 交付方式 push：推送到 GHCR（附一键 Compose 文件）
+
+`delivery_mode=push` 时不产出 TGZ，而是把全部镜像重新打标签为 `ghcr.io/<owner>/<repo>/<镜像名>:<tag>` 推送到 GHCR。同时会额外生成并上传一份 **`docker-compose-ghcr.yml`**（Artifact 名为 `docker-compose-ghcr`）：
+
+- 所有服务的 `image:` 已替换为对应的 GHCR 镜像地址（含 `ghcr.io/<owner>/<repo>/` 前缀）
+- 已移除所有 `services.*.build` 段——镜像已在 GHCR，目标服务器无需再构建
+- `docker build` 模式（无 Compose 文件）会生成仅含单服务的最小 Compose 文件
+- 生成后已通过 `docker compose config` 校验，可直接使用
+
+目标服务器上使用（放到与原 Compose 文件相同的目录，按项目要求准备好 `.env` 等 env_file）：
+
+```bash
+# 私有包先登录 GHCR
+echo "<YOUR_PAT>" | docker login ghcr.io -u <YOUR_GITHUB_USERNAME> --password-stdin
+
+# 一键启动，无需手动修改任何镜像名
+docker compose -f docker-compose-ghcr.yml up -d
+```
+
 ## 私有仓库支持
 
 ### 私有 Git 仓库（克隆目标仓库）
