@@ -400,6 +400,8 @@ jobs:
           echo "🔨 开始构建镜像 $IMAGE_NAME（平台：$PLATFORM，Dockerfile：$DOCKERFILE_PATH）"
           if ! docker buildx build --platform "$PLATFORM" --load -f "$DOCKERFILE_PATH" -t "$IMAGE_NAME" .; then
             echo "::error::镜像构建失败，请检查 Dockerfile 内容及其依赖的网络资源是否可访问"
+            echo "若日志中出现 'JavaScript heap out of memory'，是 Node.js 默认堆上限（约 4GB）不足："
+            echo "  可通过 hook_command 在构建前给 Dockerfile 中 node 基础镜像阶段插入 ENV NODE_OPTIONS 调大堆上限（示例见 README FAQ）"
             exit 1
           fi
 
@@ -670,6 +672,8 @@ jobs:
             echo "🔨 开始构建构建型服务镜像（平台：$PLATFORM）：${BUILD_SVCS[*]}"
             if ! DOCKER_DEFAULT_PLATFORM="$PLATFORM" docker compose -f "$COMPOSE_FILE_PATH" build "${BUILD_SVCS[@]}"; then
               echo "::error::构建型服务镜像构建失败，请检查对应服务的 build 配置及其依赖的网络资源是否可访问"
+              echo "若日志中出现 'JavaScript heap out of memory'，是 Node.js 默认堆上限（约 4GB）不足："
+              echo "  可通过 hook_command 在构建前给 Dockerfile 中 node 基础镜像阶段插入 ENV NODE_OPTIONS 调大堆上限（示例见 README FAQ）"
               exit 1
             fi
           fi
@@ -1246,6 +1250,7 @@ jobs:
               echo "- 参数校验失败 → 检查 repo_url 地址格式、image_name 是否为 name:tag 形式"
               echo "- 克隆失败 → 检查仓库地址；私有仓库需配置 \`CLONE_PAT\` secret"
               echo "- 构建失败 → 检查 Dockerfile 及其依赖的网络资源；arm64 构建较慢属正常现象"
+              echo "- 构建报 \`JavaScript heap out of memory\` → Node.js 默认堆上限不足，可用 \`hook_command\` 在构建前给 Dockerfile 打补丁调大（见 README FAQ）"
               echo "- 拉取失败 → 检查镜像名拼写、目标架构支持；私有镜像仓库需配置登录 secrets"
               if [[ "$DELIVERY_MODE" == "push" ]]; then
                 echo "- 推送失败 → 检查 workflow 是否具备 \`packages: write\` 权限、GHCR 登录是否成功"

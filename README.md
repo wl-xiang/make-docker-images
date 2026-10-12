@@ -302,6 +302,17 @@ A: 该报错来自 `compose pull` 模式：Compose 中有服务声明了 `build:
 **Q: `compose auto` 构建出来的镜像叫什么名字？导入后能直接被 Compose 使用吗？**
 A: 构建型服务若声明了 `image:`，构建后镜像即按该值命名；否则由 Compose 按 `<project>-<service>` 命名。若 Compose 文件声明了顶层 `name:` 则以它为准，否则本 workflow 使用目标仓库名作为项目名。请确保目标服务器上 `docker compose up` 的项目名与之相同，导入的镜像才能被直接复用（否则 Compose 会尝试重新构建/拉取）。
 
+**Q: 构建报 `FATAL ERROR: ... JavaScript heap out of memory`（exit code 134）？**
+A: 这是 **Node.js 默认 V8 堆上限（约 4GB）不足**，不是 Runner 内存不够。大型前端项目（如 open-webui 的 Vite 打包 6000+ 模块）需要更大堆。官方 CI 的通行做法是构建前动态修改 Dockerfile，在 `node` 基础镜像阶段插入 `ENV NODE_OPTIONS`。用本 workflow 的 `hook_command` 即可实现（以 open-webui 为例，与官方 CI 同款补丁）：
+
+```
+repo_url      = https://github.com/open-webui/open-webui.git
+build_mode    = compose auto
+hook_command  = awk '/^FROM --platform=\$BUILDPLATFORM node:/ {print; print "ENV NODE_OPTIONS=\"--max-old-space-size=12288\""; next} {print}' Dockerfile > Dockerfile.ci && mv Dockerfile.ci Dockerfile
+```
+
+> 说明：该 awk 会把 `ENV NODE_OPTIONS="--max-old-space-size=12288"` 插到 Dockerfile 中每个 node 基础镜像 `FROM` 行之后（其他项目若 Dockerfile 结构不同，可自行调整匹配规则）。堆上限 12288MB 需要 Runner 有足够物理内存——GitHub **公共仓库**的 `ubuntu-latest` 为 16GB 可直接使用；**私有仓库** Runner 仅 7GB，建议调小（如 `8192`）但仍可能紧张，或改用公共仓库运行。其它 Node 项目如报同样错误，同思路处理。
+
 **Q: 报错 `钩子命令执行失败`？**
 A: `hook_command` 会在目标仓库根目录执行。依次检查：① 命令拼写与参数是否正确（可先在本地目标仓库根目录验证）；② 脚本是否存在且可执行——不可执行时改用 `bash setup.sh` 形式；③ 脚本依赖的工具（如 `pnpm` / `corepack` / `python`）在 `ubuntu-latest` Runner 上是否可用（Runner 预装 node/python/docker/git 等，`pnpm` 可通过 `corepack enable` 启用，必要时把启用命令一并写入 `hook_command`）。
 
