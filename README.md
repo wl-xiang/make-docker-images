@@ -59,6 +59,7 @@
 | `force_env` | boolean | ❌ | `false` | 是否强制在目标路径生成一个空的 `.env` 文件（仅当该位置不存在 `.env` 时创建） |
 | `env_path` | string | ❌ | 空 | `.env` 文件生成目录（相对目标仓库根目录），留空表示项目根目录；仅 `force_env=true` 时生效 |
 | `image_name` | string | ⚠️ 条件必填 | 空 | 镜像名称:tag，如 `myimg:latest`，仅 `build_mode=docker build` 时使用 |
+| `hook_command` | string | ❌ | 空 | 构建/拉取前在目标仓库根目录执行的钩子命令（如 `./setup.sh`），支持 `&&` 串联多条；留空表示不执行 |
 
 **模式说明**：
 
@@ -172,6 +173,25 @@ env_path   =            （留空表示目标仓库根目录；也可填子目�
 
 `force_env=true` 时，会在 `env_path`（留空为项目根目录）生成一个空的 `.env`；若该位置已存在 `.env` 则跳过、不覆盖。
 
+### 示例六：构建/拉取前执行钩子命令（hook_command）
+
+某些项目在构建/拉取前需要先做自身的前置初始化。典型如 [plane](https://github.com/makeplane/plane)：构建前需先执行 `setup.sh`，由它生成各服务的 `.env` 与 Django `SECRET_KEY`：
+
+```
+repo_url      = https://github.com/makeplane/plane.git
+platform      = linux/amd64
+build_mode    = compose auto
+hook_command  = bash setup.sh
+```
+
+说明：
+
+- 钩子命令在**目标仓库根目录**（克隆目录）中执行，时机位于 `.env` 准备之后、真正的构建/拉取之前
+- 支持 `&&` 串联多条命令，如 `bash setup.sh && chmod +x scripts/prepare.sh && ./scripts/prepare.sh`
+- 钩子脚本中可使用以下环境变量：`HOOK_PLATFORM`（目标平台）、`HOOK_BUILD_MODE`（获取模式）、`HOOK_DELIVERY_MODE`（交付方式）、`HOOK_COMPOSE_FILE_PATH` / `HOOK_DOCKERFILE_PATH`（文件路径）
+- 钩子执行失败会立即终止 workflow，不会进入构建/拉取环节
+- 若项目自身的 setup 脚本已生成 `.env`，无需再开启 `force_env`（钩子生成的 `.env` 不会被覆盖）
+
 ## 产出物
 
 每次运行产出**一个 TGZ 文件**，命名规范：
@@ -252,13 +272,19 @@ A: arm64 构建依赖 QEMU 模拟，速度约为原生的 1/5~1/10，大型镜�
 A: 本 workflow 已用 `docker pull --platform` 强制拉取指定架构。若仍报架构错误，说明该镜像本身不支持目标架构（如仅提供 amd64 版本），需联系镜像作者。
 
 **Q: 报错 `解析 Compose 文件失败`？**
-A: Compose 文件中引用了未定义的环境变量（如 `${DB_PASSWORD}`）会导致解析失败。目标仓库需自带 `.env`、提供默认值，或开启 `force_env=true` 生成空 `.env`。
+A: 常见原因有两类，workflow 会打印 Compose 的**原始错误信息**（在失败步骤日志中查找「Compose 原始错误信息」），按提示处理：
+
+1. **`env file ... not found`**：Compose 中服务级 `env_file:` 指向的文件不存在（如 plane 的 `env_file: ./apps/api/.env` 不随仓库分发）。workflow 会**自动修复**：同目录有 `.env.example` 则复制生成，否则生成空文件并重试解析。若自动修复后仍失败，说明该 env 文件路径对应的目录结构异常，需检查 `compose_file_path` 是否指向了正确的 Compose 文件。
+2. **变量未定义**（如 `invalid interpolation format` 或变量为空导致校验失败）：Compose 引用了 `${VAR}` 且无默认值、`.env` 中又没有定义。目标仓库需自带 `.env`、提供默认值，或开启 `force_env=true` 生成空 `.env`（仅适用于变量都有默认值的场景）。
 
 **Q: 报错 `存在 build 型服务`？**
 A: 该报错来自 `compose pull` 模式：Compose 中有服务声明了 `build:` 字段，而 `compose pull` 只负责拉取镜像、不执行构建。请任选其一：① 改用 `compose auto` 模式（声明 `build:` 的服务自动构建、仅声明 `image:` 的服务拉取）；② 为这些服务补充 `image:` 字段（指向 registry 中已有的镜像）；③ 改用 `docker build` 模式（单一 Dockerfile）。
 
 **Q: `compose auto` 构建出来的镜像叫什么名字？导入后能直接被 Compose 使用吗？**
 A: 构建型服务若声明了 `image:`，构建后镜像即按该值命名；否则由 Compose 按 `<project>-<service>` 命名。若 Compose 文件声明了顶层 `name:` 则以它为准，否则本 workflow 使用目标仓库名作为项目名。请确保目标服务器上 `docker compose up` 的项目名与之相同，导入的镜像才能被直接复用（否则 Compose 会尝试重新构建/拉取）。
+
+**Q: 报错 `钩子命令执行失败`？**
+A: `hook_command` 会在目标仓库根目录执行。依次检查：① 命令拼写与参数是否正确（可先在本地目标仓库根目录验证）；② 脚本是否存在且可执行——不可执行时改用 `bash setup.sh` 形式；③ 脚本依赖的工具（如 `pnpm` / `corepack` / `python`）在 `ubuntu-latest` Runner 上是否可用（Runner 预装 node/python/docker/git 等，`pnpm` 可通过 `corepack enable` 启用，必要时把启用命令一并写入 `hook_command`）。
 
 **Q: `force_env=true` 但目标目录已有 `.env`？**
 A: 会跳过、不覆盖已有 `.env`，只在目标位置不存在 `.env` 时生成一个空文件。

@@ -14,6 +14,10 @@
 #   push : 将全部镜像重新打标签为 ghcr.io/<owner>/<repo>/<镜像名>:<tag> 并推送到 GHCR；
 #          不再产出 Artifact，摘要中给出拉取命令与国内加速代理
 #
+# 钩子命令（hook_command）：构建/拉取前在目标仓库根目录执行的自定义命令，
+#   用于项目自身的前置初始化（如 plane 需先执行 ./setup.sh 生成各服务 .env），
+#   留空不执行；执行失败会立即终止 workflow
+#
 # 触发方式：workflow_dispatch（手动触发）
 #
 # 可选 Secrets：
@@ -85,6 +89,11 @@ on:
         type: string
       image_name:
         description: '镜像名称与 tag（仅 build_mode=docker build 生效），例如 myimg:latest。留空则默认使用 <repo_name>:latest（platform=linux/arm64 时为 <repo_name>:latest-arm；repo_name 取自 repo_url 的项目名）'
+        required: false
+        default: ''
+        type: string
+      hook_command:
+        description: '构建/拉取前在目标仓库根目录执行的钩子命令（如 ./setup.sh 或 bash setup.sh），支持 && 串联多条；留空表示不执行'
         required: false
         default: ''
         type: string
@@ -304,6 +313,45 @@ jobs:
           fi
 
       # ---------------------------------------------------------------
+      # Step 6B: 执行用户钩子命令（可选，hook_command）
+      #   在真正执行构建/拉取之前，于目标仓库根目录执行用户指定的钩子命令，
+      #   用于完成项目自身的前置初始化（如 plane 需先跑 ./setup.sh 生成
+      #   各服务的 .env 与 SECRET_KEY）。支持 && 串联多条命令；
+      #   以下环境变量对钩子脚本可用：HOOK_PLATFORM / HOOK_BUILD_MODE /
+      #   HOOK_DELIVERY_MODE / HOOK_COMPOSE_FILE_PATH / HOOK_DOCKERFILE_PATH
+      # ---------------------------------------------------------------
+      - name: 执行构建/拉取前钩子命令（可选）
+        working-directory: target-repo
+        env:
+          HOOK_COMMAND: ${{ inputs.hook_command }}
+          HOOK_PLATFORM: ${{ inputs.platform }}
+          HOOK_BUILD_MODE: ${{ inputs.build_mode }}
+          HOOK_DELIVERY_MODE: ${{ inputs.delivery_mode }}
+          HOOK_COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
+          HOOK_DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
+        run: |
+          set -euo pipefail
+
+          # 去掉首尾空白（含换行、\r）后为空则跳过；保留内部空格以支持带参数的命令与 && 串联
+          HOOK_COMMAND="$(printf '%s' "$HOOK_COMMAND" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          if [[ -z "$HOOK_COMMAND" ]]; then
+            echo "ℹ️ 未填写 hook_command，跳过钩子执行"
+            exit 0
+          fi
+
+          echo "🪝 执行钩子命令（工作目录：目标仓库根目录，平台：$HOOK_PLATFORM）："
+          echo "  $HOOK_COMMAND"
+          if ! bash -c "$HOOK_COMMAND"; then
+            echo "::error::钩子命令执行失败：$HOOK_COMMAND"
+            echo "请检查："
+            echo "  1. 命令本身是否正确（可先在本地目标仓库根目录验证）"
+            echo "  2. 对应脚本是否存在于目标仓库、是否具备可执行权限（必要时改用 bash xxx.sh 形式）"
+            echo "  3. 脚本依赖的工具（如 pnpm / corepack / python 等）是否在 ubuntu-latest Runner 上可用"
+            exit 1
+          fi
+          echo "✅ 钩子命令执行完成"
+
+      # ---------------------------------------------------------------
       # Step 7A: 模式 docker build —— 从 Dockerfile 构建镜像
       #   注意：setup-buildx 之后默认构建器为 docker-container 驱动，
       #   构建结果不会自动进入本地镜像库，必须显式 --load 才能 docker save
@@ -398,8 +446,48 @@ jobs:
           fi
 
           # 解析 Compose 文件（格式错误、引用了未定义的环境变量等会在这里失败）
-          if ! CONFIG_JSON=$(docker compose -f "$COMPOSE_FILE_PATH" config --format json 2>/dev/null); then
+          # 失败时不再静默丢弃错误信息，而是：
+          #   1) 打印 Compose 原始错误，便于定位真实原因
+          #   2) 自动修复最常见的一类失败 —— 服务级 env_file 指向的文件不存在
+          #      （如 plane 的 env_file: ./apps/api/.env 不随仓库分发）：
+          #      同目录有 .env.example 则复制，否则生成空文件，然后重试解析
+          PARSE_ERR=""
+          CONFIG_JSON=""
+          for _attempt in 1 2 3 4 5; do
+            if PARSE_ERR=$(docker compose -f "$COMPOSE_FILE_PATH" config --format json 2>&1 >/dev/null); then
+              CONFIG_JSON=$(docker compose -f "$COMPOSE_FILE_PATH" config --format json)
+              break
+            fi
+            # 从错误信息中提取「env file <路径> not found」的缺失文件
+            MISSING_FILES=$(printf '%s\n' "$PARSE_ERR" | grep -oE 'env file [^ ]+ not found' | sed -E 's/^env file //; s/ not found$//' | sort -u || true)
+            if [[ -z "$MISSING_FILES" ]]; then
+              break
+            fi
+            REPAIRED=0
+            while IFS= read -r _mf; do
+              [[ -z "$_mf" ]] && continue
+              if [[ -f "$_mf" ]]; then
+                continue
+              fi
+              mkdir -p "$(dirname "$_mf")"
+              if [[ -f "$(dirname "$_mf")/.env.example" ]]; then
+                cp "$(dirname "$_mf")/.env.example" "$_mf"
+                echo "ℹ️ Compose 引用的 env 文件不存在，已根据同目录 .env.example 生成：$_mf"
+              else
+                : > "$_mf"
+                echo "ℹ️ Compose 引用的 env 文件不存在且无 .env.example，已生成空文件：$_mf"
+              fi
+              REPAIRED=1
+            done <<< "$MISSING_FILES"
+            # 本轮未能修复任何文件（文件已存在但仍失败），避免死循环
+            if [[ "$REPAIRED" -eq 0 ]]; then
+              break
+            fi
+          done
+          if [[ -z "$CONFIG_JSON" ]]; then
             echo "::error::解析 Compose 文件失败：$COMPOSE_FILE_PATH。请确认文件格式正确、引用的环境变量已有定义或默认值"
+            echo "Compose 原始错误信息（排查真实原因看这里）："
+            printf '%s\n' "$PARSE_ERR" | sed 's/^/  /'
             exit 1
           fi
 
@@ -495,8 +583,48 @@ jobs:
           fi
 
           # 解析 Compose 文件（格式错误、引用了未定义的环境变量等会在这里失败）
-          if ! CONFIG_JSON=$(docker compose -f "$COMPOSE_FILE_PATH" config --format json 2>/dev/null); then
+          # 失败时不再静默丢弃错误信息，而是：
+          #   1) 打印 Compose 原始错误，便于定位真实原因
+          #   2) 自动修复最常见的一类失败 —— 服务级 env_file 指向的文件不存在
+          #      （如 plane 的 env_file: ./apps/api/.env 不随仓库分发）：
+          #      同目录有 .env.example 则复制，否则生成空文件，然后重试解析
+          PARSE_ERR=""
+          CONFIG_JSON=""
+          for _attempt in 1 2 3 4 5; do
+            if PARSE_ERR=$(docker compose -f "$COMPOSE_FILE_PATH" config --format json 2>&1 >/dev/null); then
+              CONFIG_JSON=$(docker compose -f "$COMPOSE_FILE_PATH" config --format json)
+              break
+            fi
+            # 从错误信息中提取「env file <路径> not found」的缺失文件
+            MISSING_FILES=$(printf '%s\n' "$PARSE_ERR" | grep -oE 'env file [^ ]+ not found' | sed -E 's/^env file //; s/ not found$//' | sort -u || true)
+            if [[ -z "$MISSING_FILES" ]]; then
+              break
+            fi
+            REPAIRED=0
+            while IFS= read -r _mf; do
+              [[ -z "$_mf" ]] && continue
+              if [[ -f "$_mf" ]]; then
+                continue
+              fi
+              mkdir -p "$(dirname "$_mf")"
+              if [[ -f "$(dirname "$_mf")/.env.example" ]]; then
+                cp "$(dirname "$_mf")/.env.example" "$_mf"
+                echo "ℹ️ Compose 引用的 env 文件不存在，已根据同目录 .env.example 生成：$_mf"
+              else
+                : > "$_mf"
+                echo "ℹ️ Compose 引用的 env 文件不存在且无 .env.example，已生成空文件：$_mf"
+              fi
+              REPAIRED=1
+            done <<< "$MISSING_FILES"
+            # 本轮未能修复任何文件（文件已存在但仍失败），避免死循环
+            if [[ "$REPAIRED" -eq 0 ]]; then
+              break
+            fi
+          done
+          if [[ -z "$CONFIG_JSON" ]]; then
             echo "::error::解析 Compose 文件失败：$COMPOSE_FILE_PATH。请确认文件格式正确、引用的环境变量已有定义或默认值"
+            echo "Compose 原始错误信息（排查真实原因看这里）："
+            printf '%s\n' "$PARSE_ERR" | sed 's/^/  /'
             exit 1
           fi
 
@@ -784,6 +912,7 @@ jobs:
           DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
           COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
           INPUT_IMAGE_NAME: ${{ inputs.image_name }}
+          HOOK_COMMAND: ${{ inputs.hook_command }}
           RUN_NUMBER: ${{ github.run_number }}
           JOB_STATUS: ${{ job.status }}
         run: |
@@ -836,6 +965,11 @@ jobs:
               echo "| Compose 文件 | \`${COMPOSE_FILE_PATH:-docker-compose.yml}\` |"
             fi
             echo "| 运行状态 | \`${JOB_STATUS}\` |"
+            if [[ -n "$HOOK_COMMAND" ]]; then
+              echo "| 钩子命令 | \`$HOOK_COMMAND\` |"
+            else
+              echo "| 钩子命令 | （未执行） |"
+            fi
             echo ""
 
             if [[ "$JOB_STATUS" == "success" && "$DELIVERY_MODE" == "pack" && -n "${TGZ_NAME:-}" && -f "dist/$TGZ_NAME" ]]; then
