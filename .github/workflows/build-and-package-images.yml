@@ -19,6 +19,12 @@
 #   用于项目自身的前置初始化（如 plane 需先执行 ./setup.sh 生成各服务 .env），
 #   留空不执行；执行失败会立即终止 workflow
 #
+# Node.js 堆上限（node_heap）：大型前端项目构建时 V8 默认堆上限（约 4GB）不足会报
+#   'JavaScript heap out of memory'。选择大于 4GB 的选项时，workflow 会自动向构建涉及的
+#   Dockerfile（docker build 模式取 dockerfile_path；compose auto 模式取构建型服务的
+#   Dockerfile）中 node 基础镜像 FROM 行后插入 ENV NODE_OPTIONS 调大堆上限，
+#   无需再手写 hook_command 补丁。默认 4GB 表示不注入任何内容
+#
 # 触发方式：workflow_dispatch（手动触发）
 #
 # 可选 Secrets：
@@ -98,6 +104,16 @@ on:
         required: false
         default: ''
         type: string
+      node_heap:
+        description: 'Node.js 构建堆上限：默认 4GB 不做任何修改；选择 8GB/12GB/14GB 时自动向构建涉及的 Dockerfile 中 node 基础镜像阶段注入 ENV NODE_OPTIONS，用于大型前端项目构建报 JavaScript heap out of memory 的场景'
+        required: false
+        type: choice
+        default: 4GB
+        options:
+          - 4GB
+          - 8GB
+          - 12GB
+          - 14GB
 
 permissions:
   contents: read
@@ -355,6 +371,142 @@ jobs:
           echo "✅ 钩子命令执行完成"
 
       # ---------------------------------------------------------------
+      # Step 6C: 注入 Node.js 堆上限（可选，node_heap > 4GB 时生效）
+      #   大型前端项目构建时 V8 默认堆上限（约 4GB）不足会报
+      #   'JavaScript heap out of memory'。选择更大堆上限时，自动向构建涉及的
+      #   Dockerfile 中 node 基础镜像 FROM 行后插入 ENV NODE_OPTIONS：
+      #     - docker build 模式：打补丁 dockerfile_path 指向的 Dockerfile
+      #     - compose auto 模式：解析 Compose，打补丁全部构建型服务的 Dockerfile
+      #     - compose pull 模式：不涉及构建，无需处理
+      #   在 hook_command 之后执行：若钩子已自行注入 NODE_OPTIONS 则跳过，不会重复；
+      #   Dockerfile 中未匹配到 node 基础镜像（如镜像名经 ARG 传入）时，
+      #   回退为向全部 FROM 阶段插入（NODE_OPTIONS 对非 Node 阶段无副作用）
+      # ---------------------------------------------------------------
+      - name: 注入 Node.js 堆上限配置（可选）
+        if: ${{ inputs.node_heap != '4GB' }}
+        working-directory: target-repo
+        env:
+          BUILD_MODE: ${{ inputs.build_mode }}
+          DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
+          COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
+          NODE_HEAP: ${{ inputs.node_heap }}
+        run: |
+          set -euo pipefail
+
+          # 堆上限选项 -> V8 --max-old-space-size 值（MB）
+          case "$NODE_HEAP" in
+            8GB)  HEAP_MB=8192 ;;
+            12GB) HEAP_MB=12288 ;;
+            14GB) HEAP_MB=14336 ;;
+            *) echo "::error::node_heap 取值非法：$NODE_HEAP"; exit 1 ;;
+          esac
+
+          # 向单个 Dockerfile 的 node 基础镜像 FROM 行后插入 ENV NODE_OPTIONS
+          patch_dockerfile() {
+            local df="$1"
+            if [[ ! -f "$df" ]]; then
+              echo "::warning::Dockerfile 不存在，跳过堆上限注入：$df"
+              return 0
+            fi
+            if grep -q 'NODE_OPTIONS' "$df"; then
+              echo "ℹ️ $df 已包含 NODE_OPTIONS 配置（可能由 hook_command 注入），跳过"
+              return 0
+            fi
+            local tmp="${df}.nodeheap.tmp"
+            local before after
+            before=$(wc -l < "$df")
+            # 提取每个 FROM 行的镜像名（跳过 --platform 等 flag），
+            # 镜像名为 node 或以 /node 开头（如 node:20-alpine、library/node:22）时在其后插入 ENV
+            awk -v envline="ENV NODE_OPTIONS=\"--max-old-space-size=${HEAP_MB}\"" '
+              {
+                line = $0
+                if (tolower(line) ~ /^[ \t]*from[ \t]/) {
+                  stage_node = 0
+                  n = split(line, parts, /[ \t]+/)
+                  img = ""
+                  for (i = 2; i <= n; i++) {
+                    if (parts[i] !~ /^--/) { img = parts[i]; break }
+                  }
+                  low = tolower(img)
+                  if (low ~ /(^|\/)node([:@$]|$)/) stage_node = 1
+                }
+                print line
+                if (stage_node) { print envline; stage_node = 0 }
+              }
+            ' "$df" > "$tmp"
+            after=$(wc -l < "$tmp")
+            if [[ "$after" -eq "$before" ]]; then
+              # 未匹配到 node 基础镜像（如镜像名经 ARG 传入）：回退为向全部 FROM 阶段插入
+              echo "⚠️ $df 未匹配到 node 基础镜像 FROM 行，回退为向全部 FROM 阶段插入（NODE_OPTIONS 对非 Node 阶段无副作用）"
+              awk -v envline="ENV NODE_OPTIONS=\"--max-old-space-size=${HEAP_MB}\"" '
+                { print $0 }
+                tolower($0) ~ /^[ \t]*from[ \t]/ { print envline }
+              ' "$df" > "$tmp"
+            fi
+            mv "$tmp" "$df"
+            echo "✅ 已向 $df 注入 ENV NODE_OPTIONS=\"--max-old-space-size=${HEAP_MB}\""
+          }
+
+          # 收集需要打补丁的 Dockerfile 清单（去重）
+          DOCKERFILES=()
+          if [[ "$BUILD_MODE" == "docker build" ]]; then
+            DOCKERFILES+=("${DOCKERFILE_PATH:-Dockerfile}")
+          elif [[ "$BUILD_MODE" == "compose auto" ]]; then
+            COMPOSE_FILE_PATH="${COMPOSE_FILE_PATH:-docker-compose.yml}"
+            # .yml / .yaml 扩展名回退（与构建步骤逻辑一致）
+            if [[ ! -f "$COMPOSE_FILE_PATH" ]]; then
+              case "$COMPOSE_FILE_PATH" in
+                *.yml)  [[ -f "${COMPOSE_FILE_PATH%.yml}.yaml" ]] && COMPOSE_FILE_PATH="${COMPOSE_FILE_PATH%.yml}.yaml" ;;
+                *.yaml) [[ -f "${COMPOSE_FILE_PATH%.yaml}.yml" ]] && COMPOSE_FILE_PATH="${COMPOSE_FILE_PATH%.yaml}.yml" ;;
+              esac
+            fi
+            # best-effort 解析：解析失败不终止主流程（后续构建步骤会给出明确报错）
+            if CONFIG_JSON=$(docker compose -f "$COMPOSE_FILE_PATH" config --format json 2>/dev/null); then
+              mapfile -t BUILD_DFS < <(jq -r '
+                .services | to_entries[]
+                | select(.value.build != null)
+                | .value.build as $b
+                | if ($b | type) == "string" then "\($b)/Dockerfile"
+                  elif ($b | type) == "object" and ($b.dockerfile_inline == null) then
+                    "\( ($b.context // ".") )/\( $b.dockerfile // "Dockerfile" )"
+                  else empty end
+              ' <<<"$CONFIG_JSON" | grep -v '^[[:space:]]*$' || true)
+              for df in "${BUILD_DFS[@]:-}"; do
+                [[ -z "$df" ]] && continue
+                # 规范化路径（处理 ./ 前缀、.. 等），并确保未逃出目标仓库目录
+                df="$(realpath -m "$df")"
+                case "$df" in
+                  "$PWD"/*) DOCKERFILES+=("${df#"$PWD"/}") ;;
+                  *) echo "::warning::构建型服务的 Dockerfile 路径越出目标仓库，跳过：$df" ;;
+                esac
+              done
+            else
+              echo "::warning::Compose 文件解析失败，无法自动定位构建型服务的 Dockerfile，跳过堆上限注入"
+              echo "  （构建若仍报 'JavaScript heap out of memory'，可改用 hook_command 手动插入，示例见 README FAQ）"
+            fi
+          else
+            echo "ℹ️ build_mode=compose pull 不涉及镜像构建，无需注入 Node.js 堆上限"
+            exit 0
+          fi
+
+          # 去重（多个服务可能共用同一个 Dockerfile）
+          if [[ ${#DOCKERFILES[@]} -gt 0 ]]; then
+            mapfile -t DOCKERFILES < <(printf '%s\n' "${DOCKERFILES[@]}" | awk '!seen[$0]++')
+          fi
+
+          if [[ ${#DOCKERFILES[@]} -eq 0 ]]; then
+            echo "::warning::未定位到任何需要注入的 Dockerfile，跳过堆上限注入"
+            exit 0
+          fi
+
+          echo "🧠 为以下 Dockerfile 注入 Node.js 堆上限 ${NODE_HEAP}（--max-old-space-size=${HEAP_MB}）："
+          printf '  - %s\n' "${DOCKERFILES[@]}"
+          for df in "${DOCKERFILES[@]}"; do
+            patch_dockerfile "$df"
+          done
+          echo "✅ Node.js 堆上限注入完成"
+
+      # ---------------------------------------------------------------
       # Step 7A: 模式 docker build —— 从 Dockerfile 构建镜像
       #   注意：setup-buildx 之后默认构建器为 docker-container 驱动，
       #   构建结果不会自动进入本地镜像库，必须显式 --load 才能 docker save
@@ -401,7 +553,8 @@ jobs:
           if ! docker buildx build --platform "$PLATFORM" --load -f "$DOCKERFILE_PATH" -t "$IMAGE_NAME" .; then
             echo "::error::镜像构建失败，请检查 Dockerfile 内容及其依赖的网络资源是否可访问"
             echo "若日志中出现 'JavaScript heap out of memory'，是 Node.js 默认堆上限（约 4GB）不足："
-            echo "  可通过 hook_command 在构建前给 Dockerfile 中 node 基础镜像阶段插入 ENV NODE_OPTIONS 调大堆上限（示例见 README FAQ）"
+            echo "  可将 node_heap 输入参数调大（如 12GB），本 workflow 会自动向 Dockerfile 注入 ENV NODE_OPTIONS；"
+            echo "  Dockerfile 结构特殊时也可通过 hook_command 手动插入（示例见 README FAQ）"
             exit 1
           fi
 
@@ -673,7 +826,8 @@ jobs:
             if ! DOCKER_DEFAULT_PLATFORM="$PLATFORM" docker compose -f "$COMPOSE_FILE_PATH" build "${BUILD_SVCS[@]}"; then
               echo "::error::构建型服务镜像构建失败，请检查对应服务的 build 配置及其依赖的网络资源是否可访问"
               echo "若日志中出现 'JavaScript heap out of memory'，是 Node.js 默认堆上限（约 4GB）不足："
-              echo "  可通过 hook_command 在构建前给 Dockerfile 中 node 基础镜像阶段插入 ENV NODE_OPTIONS 调大堆上限（示例见 README FAQ）"
+              echo "  可将 node_heap 输入参数调大（如 12GB），本 workflow 会自动向构建型服务的 Dockerfile 注入 ENV NODE_OPTIONS；"
+              echo "  Dockerfile 结构特殊时也可通过 hook_command 手动插入（示例见 README FAQ）"
               exit 1
             fi
           fi
@@ -1080,6 +1234,7 @@ jobs:
           COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
           INPUT_IMAGE_NAME: ${{ inputs.image_name }}
           HOOK_COMMAND: ${{ inputs.hook_command }}
+          NODE_HEAP: ${{ inputs.node_heap }}
           RUN_NUMBER: ${{ github.run_number }}
           JOB_STATUS: ${{ job.status }}
         run: |
@@ -1125,6 +1280,7 @@ jobs:
             echo "| 模式 | \`${BUILD_MODE}\` |"
             echo "| 交付方式 | \`${DELIVERY_MODE}\` |"
             echo "| 目标平台 | \`${PLATFORM}\` |"
+            echo "| Node.js 堆上限 | \`${NODE_HEAP:-4GB}\` |"
             if [[ "$BUILD_MODE" == "docker build" ]]; then
               echo "| Dockerfile | \`${DOCKERFILE_PATH:-Dockerfile}\` |"
               echo "| 镜像名称 | \`${IMAGE_NAME}\` |"
@@ -1250,7 +1406,7 @@ jobs:
               echo "- 参数校验失败 → 检查 repo_url 地址格式、image_name 是否为 name:tag 形式"
               echo "- 克隆失败 → 检查仓库地址；私有仓库需配置 \`CLONE_PAT\` secret"
               echo "- 构建失败 → 检查 Dockerfile 及其依赖的网络资源；arm64 构建较慢属正常现象"
-              echo "- 构建报 \`JavaScript heap out of memory\` → Node.js 默认堆上限不足，可用 \`hook_command\` 在构建前给 Dockerfile 打补丁调大（见 README FAQ）"
+              echo "- 构建报 \`JavaScript heap out of memory\` → Node.js 默认堆上限不足，重新运行时把 \`node_heap\` 参数调大（本 workflow 会自动注入），或用 \`hook_command\` 手动打补丁（见 README FAQ）"
               echo "- 拉取失败 → 检查镜像名拼写、目标架构支持；私有镜像仓库需配置登录 secrets"
               if [[ "$DELIVERY_MODE" == "push" ]]; then
                 echo "- 推送失败 → 检查 workflow 是否具备 \`packages: write\` 权限、GHCR 登录是否成功"
