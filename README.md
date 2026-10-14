@@ -6,26 +6,26 @@
 
 ```
 手动触发 (workflow_dispatch)
-        │
-        ▼
+          │
+          ▼
 ┌─────────────────────┐
-│  校验输入参数        │  repo_url 格式 / image_name 必须为 name:tag
+│  校验输入参数       │  repo_url 格式 / image_name 必须为 name:tag
 └─────────┬───────────┘
           ▼
 ┌─────────────────────┐
-│  浅克隆目标仓库      │  git clone --depth 1（私有仓库支持 CLONE_PAT）
+│  浅克隆目标仓库     │  git clone --depth 1（私有仓库支持 CLONE_PAT）
 └─────────┬───────────┘
           ▼
-┌───────────────────────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────────────────────────┐
 │  获取镜像（三选一）                                                          │
 │  build_mode=docker build : docker buildx build --platform ... -t <image_name>│
-│  build_mode=compose pull : 解析 Compose，逐个 docker pull --platform 全部镜像  │
-│  build_mode=compose auto : 声明 build: 的服务构建；仅声明 image: 的拉取        │
-└─────────┬─────────────────────────────────────────────────────────────────┘
+│  build_mode=compose pull : 解析 Compose，逐个 docker pull --platform 全部镜像│
+│  build_mode=compose auto : 声明 build: 的服务构建；仅声明 image: 的拉取      │
+└─────────┬────────────────────────────────────────────────────────────────────┘
           ▼
 ┌─────────────────────┐
-│  打包上传 Artifact   │
-└─────────────────────┘
+│  打包上传 Artifact  │
+└─────────┬───────────┘
           │
           ▼
   <repo-name>_docker-images_<platform>_<yyyymmdd-HHMMSS>.tgz（可下载，离线部署用）
