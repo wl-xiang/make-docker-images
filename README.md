@@ -57,7 +57,9 @@
 | `compose_file_path` | string | ❌ | `docker-compose.yml` | Compose 文件路径，仅 `build_mode=compose pull` / `compose auto` 生效 |
 | `env_file_dir` | string | ❌ | 空 | 环境变量文件所在目录，留空表示项目根目录（存在 `.env.example` 时自动复制为 `.env`） |
 | `force_env` | boolean | ❌ | `false` | 是否强制在目标路径生成一个空的 `.env` 文件（仅当该位置不存在 `.env` 时创建） |
-| `env_path` | string | ❌ | 空 | `.env` 文件生成目录（相对目标仓库根目录），留空表示项目根目录；仅 `force_env=true` 时生效 |
+| `env_path` | string | ❌ | 空 | `.env` 文件生成目录（相对目标仓库根目录），留空表示项目根目录；`env_content` 内容写入与 `force_env` 空 `.env` 共用该目录 |
+| `env_content` | string | ❌ | 空 | `.env` 文件内容：多行用章节符 `§` 分隔（Action 输入框不支持换行），如 `PORT=4321§HOST=0.0.0.0§APP_NAME=jev`，workflow 自动转为换行后按 `env_write_mode` 写入 `env_path` 目录下的 `.env`；留空不启用。**注意**：该输入会明文显示在运行页面，敏感值建议仅用于私有仓库 |
+| `env_write_mode` | choice | ❌ | `create` | `.env` 写入模式，仅 `env_content` 非空时生效：`create` = 仅创建（已存在则跳过）/ `replace` = 覆盖已有内容 / `append` = 追加到已有文件末尾（不存在则创建） |
 | `image_name` | string | ⚠️ 条件必填 | 空 | 镜像名称:tag，如 `myimg:latest`，仅 `build_mode=docker build` 时使用 |
 | `hook_command` | string | ❌ | 空 | 构建/拉取前在目标仓库根目录执行的钩子命令（如 `./setup.sh`），支持 `&&` 串联多条；留空表示不执行 |
 | `node_heap` | choice | ❌ | `4GB` | Node.js 构建堆上限：`4GB`（默认，不做任何修改）/ `8GB` / `12GB` / `14GB`。大于 4GB 时自动向构建涉及的 Dockerfile 中 node 基础镜像 `FROM` 行后注入 `ENV NODE_OPTIONS="--max-old-space-size=..."`，用于大型前端项目构建报 `JavaScript heap out of memory` 的场景 |
@@ -80,8 +82,9 @@
 2. `build_mode=docker build` 时 `image_name` 可选（留空默认 `<repo_name>:latest`），填写时须符合 `name:tag`；`compose pull` / `compose auto` 时忽略
 3. `repo_url` 必须是合法的 `https://github.com/<owner>/<repo>` 地址
 4. 所有路径参数（`dockerfile_path` / `compose_file_path` / `env_file_dir` / `env_path`）必须为相对路径且不得包含 `..`
+5. `env_content` 经 `§` 转换后的每一行必须为 `KEY=VALUE` 形式（KEY 仅限字母/数字/下划线且不以数字开头）或 `#` 注释，否则校验失败直接终止
 
-> GitHub Actions 的 `workflow_dispatch` 不支持按条件隐藏输入框，因此 `force_env` 与 `env_path` 会始终显示；`env_path` 仅在 `force_env=true` 时生效。
+> GitHub Actions 的 `workflow_dispatch` 不支持按条件隐藏输入框，因此 `force_env` / `env_path` / `env_content` / `env_write_mode` 会始终显示；`env_path` + `force_env` 仅在 `env_content` 为空时生效，`env_content` 非空时按互斥策略跳过模板复制与空 `.env` 生成。
 
 ### 示例一：docker build 模式（amd64）
 
@@ -174,7 +177,38 @@ env_path   =            （留空表示目标仓库根目录；也可填子目�
 
 `force_env=true` 时，会在 `env_path`（留空为项目根目录）生成一个空的 `.env`；若该位置已存在 `.env` 则跳过、不覆盖。
 
-### 示例六：构建/拉取前执行钩子命令（hook_command）
+### 示例六：自定义 `.env` 内容（env_content + env_write_mode）
+
+项目需要一份确切的 `.env` 内容（仓库里没有 `.env.example`，或想完全自定义变量值）。Action 输入框不支持换行，多行内容用章节符 `§` 分隔：
+
+```
+repo_url       = https://github.com/user/some-repo.git
+platform       = linux/amd64
+build_mode     = docker build
+env_content    = PORT=4321§HOST=0.0.0.0§APP_NAME=jev
+env_write_mode = create
+env_path       =            （留空表示目标仓库根目录；也可填子目录，如 app）
+```
+
+workflow 会把 `§` 转换为换行，得到：
+
+```dotenv
+PORT=4321
+HOST=0.0.0.0
+APP_NAME=jev
+```
+
+并按 `env_write_mode` 写入 `env_path/.env`（留空 `env_path` 时为项目根目录下的 `.env`）：
+
+- `create`（默认）：目标 `.env` 不存在时创建；已存在则跳过、不改动
+- `replace`：覆盖写入（文件不存在则创建）
+- `append`：追加到已有 `.env` 末尾（自动处理末尾换行；不存在则创建）
+
+> ① `env_content` 非空时为**互斥模式**：自动跳过 `.env.example` 模板复制与 `force_env` 空 `.env` 逻辑，以用户显式内容为准。
+> ② 每行必须为 `KEY=VALUE` 或 `#` 注释（`§` 转换后校验，非法行直接终止）。
+> ③ 该输入会**明文显示**在运行页面与参数记录中，敏感值建议仅用于私有仓库，或改用 `hook_command` 从 secrets 生成。
+
+### 示例七：构建/拉取前执行钩子命令（hook_command）
 
 某些项目在构建/拉取前需要先做自身的前置初始化。典型如 [plane](https://github.com/makeplane/plane)：构建前需先执行 `setup.sh`，由它生成各服务的 `.env` 与 Django `SECRET_KEY`：
 
@@ -325,6 +359,12 @@ A: `hook_command` 会在目标仓库根目录执行。依次检查：① 命令�
 
 **Q: `force_env=true` 但目标目录已有 `.env`？**
 A: 会跳过、不覆盖已有 `.env`，只在目标位置不存在 `.env` 时生成一个空文件。
+
+**Q: 想直接自定义 `.env` 的变量值？**
+A: 填写 `env_content`（多行用 `§` 分隔，如 `PORT=4321§HOST=0.0.0.0§APP_NAME=jev`），配合 `env_write_mode` 选择写入方式（`create` 仅创建 / `replace` 覆盖 / `append` 追加），目标目录由 `env_path` 指定（留空为项目根目录）。注意：`env_content` 非空时跳过模板复制与 `force_env` 逻辑；内容会明文显示在运行页面，敏感值建议仅用于私有仓库。
+
+**Q: 报错 `.env 内容第 N 行格式非法`？**
+A: `env_content` 经 `§` 转换后，每行必须是 `KEY=VALUE` 形式（KEY 仅限字母/数字/下划线且不以数字开头）或 `#` 注释。常见原因：漏写 `=`、键名以数字开头、含空格的键名，或误把多行的分隔符写成了逗号等其他符号（必须是 `§`）。
 
 **Q: 下载的 Artifact 是 `.zip` 而不是 `.tgz`？**
 A: 正常现象。GitHub Actions 下载 Artifact 时会自动套一层 zip，解压 zip 即得到 TGZ 文件。
