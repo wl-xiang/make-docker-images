@@ -58,9 +58,6 @@
 | `env_file_dir` | string | ❌ | 空 | 环境变量文件所在目录，留空表示项目根目录（存在 `.env.example` 时自动复制为 `.env`） |
 | `force_env` | boolean | ❌ | `false` | 是否强制在目标路径生成一个空的 `.env` 文件（仅当该位置不存在 `.env` 时创建） |
 | `env_path` | string | ❌ | 空 | `.env` 文件生成目录（相对目标仓库根目录），留空表示项目根目录；仅 `force_env=true` 时生效 |
-| `env_content` | string | ❌ | 空 | 自定义 `.env` 文件内容。GitHub 输入框不支持换行，多行请用章节符号 `§` 分隔，例如 `PORT=4321§HOST=0.0.0.0§APP_NAME=jev`，workflow 会把 `§` 转换为换行后写入。留空表示不启用。⚠️ 不要写入敏感信息（公开仓库的输入对可见者公开） |
-| `env_write_mode` | choice | ❌ | `create` | `.env` 写入模式，仅 `env_content` 非空时生效：`create`=仅在不存在时创建（不覆盖）/ `replace`=覆盖已有文件 / `append`=追加到已有文件末尾（不存在则创建） |
-| `env_content_path` | string | ❌ | 空 | `env_content` 写入目录（相对目标仓库根目录），留空表示项目根目录；仅 `env_content` 非空时生效 |
 | `image_name` | string | ⚠️ 条件必填 | 空 | 镜像名称:tag，如 `myimg:latest`，仅 `build_mode=docker build` 时使用 |
 | `hook_command` | string | ❌ | 空 | 构建/拉取前在目标仓库根目录执行的钩子命令（如 `./setup.sh`），支持 `&&` 串联多条；留空表示不执行 |
 | `node_heap` | choice | ❌ | `4GB` | Node.js 构建堆上限：`4GB`（默认，不做任何修改）/ `8GB` / `12GB` / `14GB`。大于 4GB 时自动向构建涉及的 Dockerfile 中 node 基础镜像 `FROM` 行后注入 `ENV NODE_OPTIONS="--max-old-space-size=..."`，用于大型前端项目构建报 `JavaScript heap out of memory` 的场景 |
@@ -82,10 +79,9 @@
 1. `image_name` 必须包含冒号 `:` 且仅一个（格式 `name:tag`）
 2. `build_mode=docker build` 时 `image_name` 可选（留空默认 `<repo_name>:latest`），填写时须符合 `name:tag`；`compose pull` / `compose auto` 时忽略
 3. `repo_url` 必须是合法的 `https://github.com/<owner>/<repo>` 地址
-4. 所有路径参数（`dockerfile_path` / `compose_file_path` / `env_file_dir` / `env_path` / `env_content_path`）必须为相对路径且不得包含 `..`
-5. `env_content` 非空时，`env_write_mode` 必须为 `create` / `replace` / `append` 之一
+4. 所有路径参数（`dockerfile_path` / `compose_file_path` / `env_file_dir` / `env_path`）必须为相对路径且不得包含 `..`
 
-> GitHub Actions 的 `workflow_dispatch` 不支持按条件隐藏输入框，因此 `force_env` / `env_path` / `env_content` / `env_write_mode` / `env_content_path` 会始终显示；`env_path` 仅在 `force_env=true` 时生效，`env_write_mode` / `env_content_path` 仅在 `env_content` 非空时生效。
+> GitHub Actions 的 `workflow_dispatch` 不支持按条件隐藏输入框，因此 `force_env` 与 `env_path` 会始终显示；`env_path` 仅在 `force_env=true` 时生效。
 
 ### 示例一：docker build 模式（amd64）
 
@@ -196,38 +192,6 @@ hook_command  = bash setup.sh
 - 钩子脚本中可使用以下环境变量：`HOOK_PLATFORM`（目标平台）、`HOOK_BUILD_MODE`（获取模式）、`HOOK_DELIVERY_MODE`（交付方式）、`HOOK_COMPOSE_FILE_PATH` / `HOOK_DOCKERFILE_PATH`（文件路径）
 - 钩子执行失败会立即终止 workflow，不会进入构建/拉取环节
 - 若项目自身的 setup 脚本已生成 `.env`，无需再开启 `force_env`（钩子生成的 `.env` 不会被覆盖）
-
-### 示例七：自定义 `.env` 内容（env_content）
-
-仓库里没有 `.env` / `.env.example`，或想在构建/拉取前直接写入指定的环境变量。GitHub 输入框不支持换行，因此多行内容用章节符号 `§` 分隔：
-
-```
-repo_url         = https://github.com/user/some-repo.git
-platform         = linux/amd64
-build_mode       = compose auto
-env_content      = PORT=4321§HOST=0.0.0.0§APP_NAME=jev
-env_write_mode   = create        # create（默认，不存在才创建）/ replace（覆盖）/ append（追加）
-env_content_path =                 # 留空=目标仓库根目录；也可填子目录，如 app
-```
-
-workflow 会：
-
-1. 把 `env_content` 中的 `§` 转换为换行，得到
-   ```
-   PORT=4321
-   HOST=0.0.0.0
-   APP_NAME=jev
-   ```
-2. 根据 `env_write_mode` 写入 `env_content_path`（留空为项目根目录）下的 `.env`：
-   - `create`：`.env` 不存在才写入；已存在则跳过、不覆盖
-   - `replace`：直接覆盖已有 `.env`（不存在则创建）
-   - `append`：追加到已有 `.env` 末尾（不存在则创建）
-
-说明：
-
-- 该步骤在 `.env.example` 自动复制与 `force_env` **之前**执行，优先级最高；因此当 `env_content` 已生成 `.env` 后，后两者会自然跳过
-- `env_content` 留空时该功能完全不生效，原有 `.env` 处理逻辑不受影响
-- ⚠️ `env_content` 的值会保存在 workflow 运行记录中（公开仓库对可见者公开），**请勿写入密码 / 密钥**，敏感值请改用仓库 Secrets
 
 ## 产出物
 
@@ -361,15 +325,6 @@ A: `hook_command` 会在目标仓库根目录执行。依次检查：① 命令�
 
 **Q: `force_env=true` 但目标目录已有 `.env`？**
 A: 会跳过、不覆盖已有 `.env`，只在目标位置不存在 `.env` 时生成一个空文件。
-
-**Q: `env_content` 怎么输入多行？为什么用 `§`？**
-A: GitHub Actions 的 `workflow_dispatch` 输入框不支持换行，因此多行内容用章节符号 `§` 分隔，例如 `PORT=4321§HOST=0.0.0.0§APP_NAME=jev`，workflow 会把 `§` 自动转换为换行后写入 `.env`。
-
-**Q: `env_content` 会覆盖仓库里已有的 `.env` 吗？**
-A: 取决于 `env_write_mode`：`create`（默认）只在 `.env` 不存在时创建、已存在则跳过；`replace` 会覆盖；`append` 会追加到末尾。该步骤在 `.env.example` 复制与 `force_env` 之前执行，优先级最高。
-
-**Q: 可以把密码 / 密钥写进 `env_content` 吗？**
-A: 不建议。`env_content` 的值会保存在 workflow 运行记录中（公开仓库对可见者公开），敏感值请改用仓库 Secrets，仅将非敏感的配置项写入 `env_content`。
 
 **Q: 下载的 Artifact 是 `.zip` 而不是 `.tgz`？**
 A: 正常现象。GitHub Actions 下载 Artifact 时会自动套一层 zip，解压 zip 即得到 TGZ 文件。
