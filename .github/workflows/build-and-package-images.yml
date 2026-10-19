@@ -1,0 +1,1489 @@
+# =====================================================================
+# Build and Package Docker Images
+#
+# 完整链路：Git Clone 用户仓库 → 构建或拉取 Docker 镜像 → 打包产出 TGZ Artifact 或推送到 GHCR
+#
+# 三种获取模式（build_mode）：
+#   docker build : 从用户仓库的 Dockerfile 构建镜像（按目标平台原生架构构建）
+#   compose pull : 解析用户仓库的 Compose 文件，拉取其中定义的全部镜像（服务必须声明 image:）
+#   compose auto : 解析 Compose 文件，按服务自动处理 —— 声明 build: 则用 Compose 构建该服务镜像
+#                  （即使同时声明 image: 也按构建处理），仅声明 image:（无 build:）则拉取
+#
+# 两种交付方式（delivery_mode）：
+#   pack : 将全部镜像 docker save 并压缩为 TGZ，上传到 Artifacts（默认）
+#   push : 将全部镜像重新打标签为 ghcr.io/<owner>/<repo>/<镜像名>:<tag> 并推送到 GHCR；
+#          并生成 docker-compose-ghcr.yml（所有 image: 已替换为 GHCR 地址、build: 段已移除）
+#          上传为 Artifact（docker-compose-ghcr），摘要中给出拉取命令与国内加速代理
+#
+# 钩子命令（hook_command）：构建/拉取前在目标仓库根目录执行的自定义命令，
+#   用于项目自身的前置初始化（如 plane 需先执行 ./setup.sh 生成各服务 .env），
+#   留空不执行；执行失败会立即终止 workflow
+#
+# Node.js 堆上限（node_heap）：大型前端项目构建时 V8 默认堆上限（约 4GB）不足会报
+#   'JavaScript heap out of memory'。选择大于 4GB 的选项时，workflow 会自动向构建涉及的
+#   Dockerfile（docker build 模式取 dockerfile_path；compose auto 模式取构建型服务的
+#   Dockerfile）中 node 基础镜像 FROM 行后插入 ENV NODE_OPTIONS 调大堆上限，
+#   无需再手写 hook_command 补丁。默认 4GB 表示不注入任何内容
+#
+# Runner 选择（按目标平台自动匹配原生架构，避免 QEMU 跨架构模拟的性能损失）：
+#   linux/amd64 → ubuntu-latest（X86_64 原生）
+#   linux/arm64 → ubuntu-24.04-arm（ARM64 原生，公开仓库免费）
+#   两种情况 Docker build 均为原生执行；QEMU 仅在 Runner 架构与目标平台
+#   不一致时兜底安装（如私有仓库无 ARM Runner 权限被迫回退 x86 的场景，
+#   GitHub 托管 ARM Runner 对私有仓库需付费套餐，见 runs-on 处注释）
+#
+# 触发方式：workflow_dispatch（手动触发）
+#
+# 可选 Secrets：
+#   CLONE_PAT          克隆私有 Git 仓库用的 PAT（repo 读权限）
+#   REGISTRY_SERVER    私有镜像仓库地址（如 registry.example.com:5000，默认 docker.io）
+#   REGISTRY_USERNAME  私有镜像仓库用户名
+#   REGISTRY_PASSWORD  私有镜像仓库密码/令牌
+#   （push 到 GHCR 使用内置 GITHUB_TOKEN，无需额外配置 secret）
+# =====================================================================
+
+name: Build and Package Docker Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'GitHub 仓库克隆链接，例如 https://github.com/wl-xiang/code-server-ai.git'
+        required: true
+        type: string
+      platform:
+        description: '目标部署服务器平台'
+        required: true
+        type: choice
+        default: linux/amd64
+        options:
+          - linux/amd64
+          - linux/arm64
+      build_mode:
+        description: '镜像获取模式：docker build = 从 Dockerfile 构建；compose pull = 从 Compose 拉取；compose auto = 按 Compose 服务自动构建/拉取'
+        required: true
+        type: choice
+        default: compose auto
+        options:
+          - docker build
+          - compose pull
+          - compose auto
+      delivery_mode:
+        description: '镜像交付方式：pack = 打包为 TGZ 上传到 Artifacts；push = 推送到 GHCR 镜像仓库（ghcr.io/<owner>/<repo>/...）'
+        required: true
+        type: choice
+        default: pack
+        options:
+          - pack
+          - push
+      dockerfile_path:
+        description: 'Dockerfile 路径（仅 build_mode=docker build 生效）。根目录填 Dockerfile，子目录填 path/to/Dockerfile'
+        required: false
+        default: 'Dockerfile'
+        type: string
+      compose_file_path:
+        description: 'Docker Compose 文件路径（仅 build_mode=compose pull / compose auto 生效）'
+        required: false
+        default: 'docker-compose.yml'
+        type: string
+      env_file_dir:
+        description: '环境变量文件（.env / .env.example）所在目录（相对目标仓库根目录），留空表示项目根目录'
+        required: false
+        default: ''
+        type: string
+      force_env:
+        description: '是否强制在目标路径生成一个空的 .env 文件（目标位置无 .env 时创建）'
+        required: false
+        type: boolean
+        default: false
+      env_path:
+        description: '.env 文件生成目录（相对目标仓库根目录），留空表示项目根目录；仅 force_env=true 时生效'
+        required: false
+        default: ''
+        type: string
+      image_name:
+        description: '镜像名称与 tag（仅 build_mode=docker build 生效），例如 myimg:latest。留空则默认使用 <repo_name>:latest（platform=linux/arm64 时为 <repo_name>:latest-arm；repo_name 取自 repo_url 的项目名）'
+        required: false
+        default: ''
+        type: string
+      hook_command:
+        description: '构建/拉取前在目标仓库根目录执行的钩子命令（如 ./setup.sh 或 bash setup.sh），支持 && 串联多条；留空表示不执行'
+        required: false
+        default: ''
+        type: string
+      node_heap:
+        description: 'Node.js 构建堆上限：默认 4GB 不做任何修改；选择 8GB/12GB/14GB 时自动向构建涉及的 Dockerfile 中 node 基础镜像阶段注入 ENV NODE_OPTIONS，用于大型前端项目构建报 JavaScript heap out of memory 的场景'
+        required: false
+        type: choice
+        default: 4GB
+        options:
+          - 4GB
+          - 8GB
+          - 12GB
+          - 14GB
+
+permissions:
+  contents: read
+  # push 到 GHCR 需要 packages: write（GITHUB_TOKEN 默认权限不足时需在仓库设置中放开）
+  packages: write
+
+env:
+  # 克隆目标仓库的本地目录名
+  TARGET_DIR: target-repo
+  # 镜像列表文件（build/pull 两个分支共同写入，导出/推送步骤统一消费）
+  IMAGE_LIST_FILE: image-list.txt
+  # 服务→镜像映射文件（service<TAB>image，用于生成 GHCR 版 Compose 文件）
+  SERVICE_IMAGE_FILE: service-images.tsv
+  # GHCR 相关常量（delivery_mode=push 时使用）
+  GHCR_REGISTRY: ghcr.io
+  GHCR_OWNER: ${{ github.repository_owner }}
+  # 推送成功清单（原镜像<TAB>GHCR目标名），供摘要步骤消费
+  GHCR_PUSHED_FILE: ghcr-pushed.txt
+
+jobs:
+  build-and-package:
+    name: Build / Pull and Package Images
+    # 按目标平台选择原生架构 Runner，避免 QEMU 跨架构模拟带来的大幅性能损失：
+    #   linux/amd64 → ubuntu-latest（X86_64 原生）
+    #   linux/arm64 → ubuntu-24.04-arm（ARM64 原生）
+    #   注：GitHub 托管 ARM Runner 对公开仓库免费；私有仓库需付费套餐，
+    #   若无权限调度 ARM Runner（报 no runner matching）可临时改回
+    #   ubuntu-latest，下方 QEMU 步骤会自动兜底为跨架构模拟
+    runs-on: ${{ inputs.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 60
+
+    steps:
+      # ---------------------------------------------------------------
+      # Step 1: 检出本仓库（workflow 所在仓库）
+      # ---------------------------------------------------------------
+      - name: Checkout 本仓库
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # Step 2: 校验输入参数（任何一项不通过则立即终止）
+      # ---------------------------------------------------------------
+      - name: 校验输入参数
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          PLATFORM: ${{ inputs.platform }}
+          BUILD_MODE: ${{ inputs.build_mode }}
+          DELIVERY_MODE: ${{ inputs.delivery_mode }}
+          DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
+          COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
+          ENV_FILE_DIR: ${{ inputs.env_file_dir }}
+          FORCE_ENV: ${{ inputs.force_env }}
+          ENV_PATH: ${{ inputs.env_path }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
+          # -- 1. 仓库地址格式校验（允许可选的 .git 后缀与结尾斜杠）--
+          if [[ ! "$REPO_URL" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(\.git)?/?$ ]]; then
+            fail "repo_url 不合法（当前值：$REPO_URL）。必须是形如 https://github.com/<owner>/<repo> 的 GitHub 仓库地址"
+          fi
+
+          # -- 2. 路径参数校验（必须为相对路径，且不得包含 ..）--
+          for p in "$DOCKERFILE_PATH" "$COMPOSE_FILE_PATH" "$ENV_FILE_DIR" "$ENV_PATH"; do
+            [[ -z "$p" ]] && continue
+            [[ "$p" == /* ]] && fail "路径参数必须为相对路径（相对目标仓库根目录）：$p"
+            [[ "$p" == *..* ]] && fail "路径参数不得包含 '..'：$p"
+          done
+
+          # -- 3. 模式联动校验 --
+          if [[ "$BUILD_MODE" == "docker build" ]]; then
+            if [[ -z "${IMAGE_NAME// /}" ]]; then
+              # 留空时构建阶段将默认使用 <repo_name>:<默认tag>（arm64 为 latest-arm），此处跳过格式校验
+              echo "build_mode=docker build：未填写 image_name，构建时将默认使用 <repo_name>:latest（platform=linux/arm64 时为 <repo_name>:latest-arm）"
+            else
+              if [[ "$IMAGE_NAME" != *:* ]]; then
+                fail "image_name 必须包含冒号 ':'（即必须显式指定 tag，格式 name:tag），当前值：$IMAGE_NAME"
+              fi
+              # 按最后一个冒号拆分（兼容 registry.example.com:5000/name 形式的镜像名）
+              NAME_PART="${IMAGE_NAME%:*}"
+              TAG_PART="${IMAGE_NAME##*:}"
+              if [[ -z "$NAME_PART" ]]; then
+                fail "image_name 的名称部分不能为空，当前值：$IMAGE_NAME"
+              fi
+              if [[ -z "$TAG_PART" ]]; then
+                fail "image_name 的 tag 部分不能为空（必须显式指定 tag），当前值：$IMAGE_NAME"
+              fi
+              if [[ "$TAG_PART" == */* ]]; then
+                fail "image_name 格式不正确（tag 部分不能包含 '/'），当前值：$IMAGE_NAME"
+              fi
+              if [[ "$IMAGE_NAME" =~ [[:space:]] ]]; then
+                fail "image_name 不能包含空白字符，当前值：$IMAGE_NAME"
+              fi
+              if [[ "$NAME_PART" =~ [A-Z] ]]; then
+                fail "image_name 的名称部分必须全小写（Docker 镜像名规范），当前值：$IMAGE_NAME"
+              fi
+            fi
+          else
+            echo "build_mode=$BUILD_MODE：image_name 将被忽略（镜像列表由 Compose 文件决定）"
+          fi
+
+          # -- 4. 交付方式校验 --
+          if [[ "$DELIVERY_MODE" != "pack" && "$DELIVERY_MODE" != "push" ]]; then
+            fail "delivery_mode 取值非法（当前值：$DELIVERY_MODE），只允许 pack 或 push"
+          fi
+
+          echo "✅ 输入参数校验通过（build_mode=$BUILD_MODE，delivery_mode=$DELIVERY_MODE，platform=$PLATFORM）"
+
+      # ---------------------------------------------------------------
+      # Step 3: 浅克隆用户目标仓库
+      #   私有仓库支持：在本仓库 Settings → Secrets → Actions 中配置
+      #   CLONE_PAT（具有 repo 读权限的 PAT）即可，无需修改 workflow
+      #   GIT_TERMINAL_PROMPT=0：凭据缺失时快速失败，避免挂起等待输入
+      # ---------------------------------------------------------------
+      - name: 克隆目标仓库
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          CLONE_PAT: ${{ secrets.CLONE_PAT }}
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          set -euo pipefail
+
+          CLONE_URL="$REPO_URL"
+          if [[ -n "$CLONE_PAT" ]]; then
+            # 将 https://github.com/... 替换为带 PAT 的形式（GitHub 会在日志中自动掩码令牌）
+            CLONE_URL="https://x-access-token:${CLONE_PAT}@github.com/${REPO_URL#https://github.com/}"
+            echo "已配置 CLONE_PAT，将以令牌方式克隆私有仓库"
+          fi
+
+          if ! git clone --depth 1 "$CLONE_URL" "$TARGET_DIR"; then
+            echo "::error::克隆失败：$REPO_URL"
+            echo "请依次检查："
+            echo "  1. 仓库地址是否正确、仓库是否存在"
+            echo "  2. 若为私有仓库，请在本仓库 Settings → Secrets and variables → Actions 中配置 CLONE_PAT（需 repo 读权限的 PAT）"
+            exit 1
+          fi
+          echo "✅ 目标仓库克隆成功"
+
+      # ---------------------------------------------------------------
+      # Step 4: 校验 Runner 架构 + 按需安装 QEMU + 安装 Buildx
+      #   常规情况（amd64→X64、arm64→ARM64 原生 Runner）目标平台与
+      #   Runner 架构一致，Docker build 全程原生执行，跳过 QEMU 安装
+      #   QEMU：仅在 Runner 架构与目标平台不一致时兜底安装
+      #   （如在 x86 Runner 上模拟 arm64 执行 Dockerfile 中的 RUN 指令）
+      #   Buildx：docker-container 驱动构建器，支持 --platform 指定目标平台
+      # ---------------------------------------------------------------
+      - name: 校验 Runner 架构
+        run: |
+          echo "Runner 内核架构：$(uname -m)（GitHub runner.arch=${{ runner.arch }}）"
+          echo "目标平台：${{ inputs.platform }}"
+
+      - name: 安装 QEMU（仅 Runner 架构与目标平台不一致时兜底）
+        if: ${{ inputs.platform == 'linux/arm64' && runner.arch != 'ARM64' }}
+        uses: docker/setup-qemu-action@v3
+
+      - name: 安装 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ---------------------------------------------------------------
+      # Step 5: 登录私有镜像仓库（可选）
+      #   配置了 REGISTRY_USERNAME / REGISTRY_PASSWORD secrets 时自动生效，
+      #   用于 docker build 模式拉取私有基础镜像、compose pull / compose auto
+      #   模式拉取私有业务镜像
+      # ---------------------------------------------------------------
+      - name: 登录镜像仓库（可选）
+        env:
+          REGISTRY_SERVER: ${{ secrets.REGISTRY_SERVER }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${REGISTRY_USERNAME:-}" || -z "${REGISTRY_PASSWORD:-}" ]]; then
+            echo "未配置 REGISTRY_USERNAME / REGISTRY_PASSWORD secrets，跳过镜像仓库登录（仅可访问公开镜像）"
+            exit 0
+          fi
+          SERVER="${REGISTRY_SERVER:-docker.io}"
+          echo "🔐 登录镜像仓库：$SERVER"
+          echo "$REGISTRY_PASSWORD" | docker login "$SERVER" --username "$REGISTRY_USERNAME" --password-stdin
+          echo "REGISTRY_LOGGED_IN=1" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # Step 6: 准备环境变量文件（.env，可选）
+      #   1) 常规：部分项目的 Docker build / Compose pull 会读取 .env，而仓库
+      #      通常只提供 .env.example 模板。若指定目录下存在 .env.example 且不
+      #      存在 .env，则自动复制一份，避免因缺少 .env 导致构建/拉取失败。
+      #      env_file_dir 留空表示目标仓库根目录。
+      #   2) 强制：force_env=true 时，在 env_path 指定目录（留空表示目标仓库
+      #      根目录）强制生成一个空的 .env 文件（仅当该位置不存在 .env 时创建）。
+      # ---------------------------------------------------------------
+      - name: 准备环境变量文件（.env）
+        working-directory: target-repo
+        env:
+          ENV_FILE_DIR: ${{ inputs.env_file_dir }}
+          FORCE_ENV: ${{ inputs.force_env }}
+          ENV_PATH: ${{ inputs.env_path }}
+        run: |
+          set -euo pipefail
+
+          # -- 1. 常规：从 .env.example 复制（留空时使用目标仓库根目录）--
+          TARGET_PATH="${ENV_FILE_DIR:-.}"
+          if [[ ! -d "$TARGET_PATH" ]]; then
+            echo "::error::环境变量文件目录不存在：$TARGET_PATH（路径相对于目标仓库根目录）"
+            exit 1
+          fi
+
+          if [[ -f "$TARGET_PATH/.env" ]]; then
+            echo "ℹ️ $TARGET_PATH/.env 已存在，跳过复制"
+          elif [[ ! -f "$TARGET_PATH/.env.example" ]]; then
+            echo "ℹ️ 未找到 $TARGET_PATH/.env.example，跳过复制（如项目无需 .env 可忽略）"
+          else
+            cp "$TARGET_PATH/.env.example" "$TARGET_PATH/.env"
+            echo "✅ 已根据 .env.example 生成 $TARGET_PATH/.env"
+          fi
+
+          # -- 2. 强制：生成空 .env（force_env=true 时生效）--
+          if [[ "${FORCE_ENV:-false}" == "true" ]]; then
+            FORCE_PATH="${ENV_PATH:-.}"
+            if [[ ! -d "$FORCE_PATH" ]]; then
+              echo "::error::env_path 目录不存在：$FORCE_PATH（路径相对于目标仓库根目录）"
+              exit 1
+            fi
+            if [[ -f "$FORCE_PATH/.env" ]]; then
+              echo "ℹ️ $FORCE_PATH/.env 已存在，跳过强制生成"
+            else
+              : > "$FORCE_PATH/.env"
+              echo "✅ 已强制生成空 .env：$FORCE_PATH/.env"
+            fi
+          fi
+
+      # ---------------------------------------------------------------
+      # Step 6B: 执行用户钩子命令（可选，hook_command）
+      #   在真正执行构建/拉取之前，于目标仓库根目录执行用户指定的钩子命令，
+      #   用于完成项目自身的前置初始化（如 plane 需先跑 ./setup.sh 生成
+      #   各服务的 .env 与 SECRET_KEY）。支持 && 串联多条命令；
+      #   以下环境变量对钩子脚本可用：HOOK_PLATFORM / HOOK_BUILD_MODE /
+      #   HOOK_DELIVERY_MODE / HOOK_COMPOSE_FILE_PATH / HOOK_DOCKERFILE_PATH
+      # ---------------------------------------------------------------
+      - name: 执行构建/拉取前钩子命令（可选）
+        working-directory: target-repo
+        env:
+          HOOK_COMMAND: ${{ inputs.hook_command }}
+          HOOK_PLATFORM: ${{ inputs.platform }}
+          HOOK_BUILD_MODE: ${{ inputs.build_mode }}
+          HOOK_DELIVERY_MODE: ${{ inputs.delivery_mode }}
+          HOOK_COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
+          HOOK_DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
+        run: |
+          set -euo pipefail
+
+          # 去掉首尾空白（含换行、\r）后为空则跳过；保留内部空格以支持带参数的命令与 && 串联
+          HOOK_COMMAND="$(printf '%s' "$HOOK_COMMAND" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          if [[ -z "$HOOK_COMMAND" ]]; then
+            echo "ℹ️ 未填写 hook_command，跳过钩子执行"
+            exit 0
+          fi
+
+          echo "🪝 执行钩子命令（工作目录：目标仓库根目录，平台：$HOOK_PLATFORM）："
+          echo "  $HOOK_COMMAND"
+          if ! bash -c "$HOOK_COMMAND"; then
+            echo "::error::钩子命令执行失败：$HOOK_COMMAND"
+            echo "请检查："
+            echo "  1. 命令本身是否正确（可先在本地目标仓库根目录验证）"
+            echo "  2. 对应脚本是否存在于目标仓库、是否具备可执行权限（必要时改用 bash xxx.sh 形式）"
+            echo "  3. 脚本依赖的工具（如 pnpm / corepack / python 等）是否在 GitHub 托管 Runner 上可用"
+            exit 1
+          fi
+          echo "✅ 钩子命令执行完成"
+
+      # ---------------------------------------------------------------
+      # Step 6C: 注入 Node.js 堆上限（可选，node_heap > 4GB 时生效）
+      #   大型前端项目构建时 V8 默认堆上限（约 4GB）不足会报
+      #   'JavaScript heap out of memory'。选择更大堆上限时，自动向构建涉及的
+      #   Dockerfile 中 node 基础镜像 FROM 行后插入 ENV NODE_OPTIONS：
+      #     - docker build 模式：打补丁 dockerfile_path 指向的 Dockerfile
+      #     - compose auto 模式：解析 Compose，打补丁全部构建型服务的 Dockerfile
+      #     - compose pull 模式：不涉及构建，无需处理
+      #   在 hook_command 之后执行：若钩子已自行注入 NODE_OPTIONS 则跳过，不会重复；
+      #   Dockerfile 中未匹配到 node 基础镜像（如镜像名经 ARG 传入）时，
+      #   回退为向全部 FROM 阶段插入（NODE_OPTIONS 对非 Node 阶段无副作用）
+      # ---------------------------------------------------------------
+      - name: 注入 Node.js 堆上限配置（可选）
+        if: ${{ inputs.node_heap != '4GB' }}
+        working-directory: target-repo
+        env:
+          BUILD_MODE: ${{ inputs.build_mode }}
+          DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
+          COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
+          NODE_HEAP: ${{ inputs.node_heap }}
+        run: |
+          set -euo pipefail
+
+          # 堆上限选项 -> V8 --max-old-space-size 值（MB）
+          case "$NODE_HEAP" in
+            8GB)  HEAP_MB=8192 ;;
+            12GB) HEAP_MB=12288 ;;
+            14GB) HEAP_MB=14336 ;;
+            *) echo "::error::node_heap 取值非法：$NODE_HEAP"; exit 1 ;;
+          esac
+
+          # 向单个 Dockerfile 的 node 基础镜像 FROM 行后插入 ENV NODE_OPTIONS
+          patch_dockerfile() {
+            local df="$1"
+            if [[ ! -f "$df" ]]; then
+              echo "::warning::Dockerfile 不存在，跳过堆上限注入：$df"
+              return 0
+            fi
+            if grep -q 'NODE_OPTIONS' "$df"; then
+              echo "ℹ️ $df 已包含 NODE_OPTIONS 配置（可能由 hook_command 注入），跳过"
+              return 0
+            fi
+            local tmp="${df}.nodeheap.tmp"
+            local before after
+            before=$(wc -l < "$df")
+            # 提取每个 FROM 行的镜像名（跳过 --platform 等 flag），
+            # 镜像名为 node 或以 /node 开头（如 node:20-alpine、library/node:22）时在其后插入 ENV
+            awk -v envline="ENV NODE_OPTIONS=\"--max-old-space-size=${HEAP_MB}\"" '
+              {
+                line = $0
+                if (tolower(line) ~ /^[ \t]*from[ \t]/) {
+                  stage_node = 0
+                  n = split(line, parts, /[ \t]+/)
+                  img = ""
+                  for (i = 2; i <= n; i++) {
+                    if (parts[i] !~ /^--/) { img = parts[i]; break }
+                  }
+                  low = tolower(img)
+                  if (low ~ /(^|\/)node([:@$]|$)/) stage_node = 1
+                }
+                print line
+                if (stage_node) { print envline; stage_node = 0 }
+              }
+            ' "$df" > "$tmp"
+            after=$(wc -l < "$tmp")
+            if [[ "$after" -eq "$before" ]]; then
+              # 未匹配到 node 基础镜像（如镜像名经 ARG 传入）：回退为向全部 FROM 阶段插入
+              echo "⚠️ $df 未匹配到 node 基础镜像 FROM 行，回退为向全部 FROM 阶段插入（NODE_OPTIONS 对非 Node 阶段无副作用）"
+              awk -v envline="ENV NODE_OPTIONS=\"--max-old-space-size=${HEAP_MB}\"" '
+                { print $0 }
+                tolower($0) ~ /^[ \t]*from[ \t]/ { print envline }
+              ' "$df" > "$tmp"
+            fi
+            mv "$tmp" "$df"
+            echo "✅ 已向 $df 注入 ENV NODE_OPTIONS=\"--max-old-space-size=${HEAP_MB}\""
+          }
+
+          # 收集需要打补丁的 Dockerfile 清单（去重）
+          DOCKERFILES=()
+          if [[ "$BUILD_MODE" == "docker build" ]]; then
+            DOCKERFILES+=("${DOCKERFILE_PATH:-Dockerfile}")
+          elif [[ "$BUILD_MODE" == "compose auto" ]]; then
+            COMPOSE_FILE_PATH="${COMPOSE_FILE_PATH:-docker-compose.yml}"
+            # .yml / .yaml 扩展名回退（与构建步骤逻辑一致）
+            if [[ ! -f "$COMPOSE_FILE_PATH" ]]; then
+              case "$COMPOSE_FILE_PATH" in
+                *.yml)  [[ -f "${COMPOSE_FILE_PATH%.yml}.yaml" ]] && COMPOSE_FILE_PATH="${COMPOSE_FILE_PATH%.yml}.yaml" ;;
+                *.yaml) [[ -f "${COMPOSE_FILE_PATH%.yaml}.yml" ]] && COMPOSE_FILE_PATH="${COMPOSE_FILE_PATH%.yaml}.yml" ;;
+              esac
+            fi
+            # best-effort 解析：解析失败不终止主流程（后续构建步骤会给出明确报错）
+            if CONFIG_JSON=$(docker compose -f "$COMPOSE_FILE_PATH" config --format json 2>/dev/null); then
+              mapfile -t BUILD_DFS < <(jq -r '
+                .services | to_entries[]
+                | select(.value.build != null)
+                | .value.build as $b
+                | if ($b | type) == "string" then "\($b)/Dockerfile"
+                  elif ($b | type) == "object" and ($b.dockerfile_inline == null) then
+                    "\( ($b.context // ".") )/\( $b.dockerfile // "Dockerfile" )"
+                  else empty end
+              ' <<<"$CONFIG_JSON" | grep -v '^[[:space:]]*$' || true)
+              for df in "${BUILD_DFS[@]:-}"; do
+                [[ -z "$df" ]] && continue
+                # 规范化路径（处理 ./ 前缀、.. 等），并确保未逃出目标仓库目录
+                df="$(realpath -m "$df")"
+                case "$df" in
+                  "$PWD"/*) DOCKERFILES+=("${df#"$PWD"/}") ;;
+                  *) echo "::warning::构建型服务的 Dockerfile 路径越出目标仓库，跳过：$df" ;;
+                esac
+              done
+            else
+              echo "::warning::Compose 文件解析失败，无法自动定位构建型服务的 Dockerfile，跳过堆上限注入"
+              echo "  （构建若仍报 'JavaScript heap out of memory'，可改用 hook_command 手动插入，示例见 README FAQ）"
+            fi
+          else
+            echo "ℹ️ build_mode=compose pull 不涉及镜像构建，无需注入 Node.js 堆上限"
+            exit 0
+          fi
+
+          # 去重（多个服务可能共用同一个 Dockerfile）
+          if [[ ${#DOCKERFILES[@]} -gt 0 ]]; then
+            mapfile -t DOCKERFILES < <(printf '%s\n' "${DOCKERFILES[@]}" | awk '!seen[$0]++')
+          fi
+
+          if [[ ${#DOCKERFILES[@]} -eq 0 ]]; then
+            echo "::warning::未定位到任何需要注入的 Dockerfile，跳过堆上限注入"
+            exit 0
+          fi
+
+          echo "🧠 为以下 Dockerfile 注入 Node.js 堆上限 ${NODE_HEAP}（--max-old-space-size=${HEAP_MB}）："
+          printf '  - %s\n' "${DOCKERFILES[@]}"
+          for df in "${DOCKERFILES[@]}"; do
+            patch_dockerfile "$df"
+          done
+          echo "✅ Node.js 堆上限注入完成"
+
+      # ---------------------------------------------------------------
+      # Step 7A: 模式 docker build —— 从 Dockerfile 构建镜像
+      #   注意：setup-buildx 之后默认构建器为 docker-container 驱动，
+      #   构建结果不会自动进入本地镜像库，必须显式 --load 才能 docker save
+      # ---------------------------------------------------------------
+      - name: 构建镜像（build_mode=docker build）
+        if: ${{ inputs.build_mode == 'docker build' }}
+        working-directory: target-repo
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          # image_name 留空时，默认使用 <repo_name>:<默认tag>（repo_name 取自 repo_url 的项目名）
+          # linux/arm64 平台默认 tag 为 latest-arm，其余平台为 latest
+          DEFAULT_TAG="latest"
+          if [[ "$PLATFORM" == "linux/arm64" ]]; then
+            DEFAULT_TAG="latest-arm"
+          fi
+          if [[ -z "${IMAGE_NAME// /}" ]]; then
+            REPO_NAME="${REPO_URL%/}"
+            REPO_NAME="${REPO_NAME%.git}"
+            REPO_NAME="${REPO_NAME##*/}"
+            REPO_NAME="${REPO_NAME,,}"
+            if [[ -z "$REPO_NAME" ]]; then
+              echo "::error::image_name 留空且无法从 repo_url 解析出项目名：$REPO_URL"
+              exit 1
+            fi
+            IMAGE_NAME="${REPO_NAME}:${DEFAULT_TAG}"
+            echo "ℹ️ 未填写 image_name，已使用默认值：$IMAGE_NAME（platform=$PLATFORM，默认 tag=$DEFAULT_TAG）"
+          fi
+          echo "IMAGE_NAME=$IMAGE_NAME" >> "$GITHUB_ENV"
+
+          # Dockerfile 存在性检查（为空时使用默认值）
+          DOCKERFILE_PATH="${DOCKERFILE_PATH:-Dockerfile}"
+          if [[ ! -f "$DOCKERFILE_PATH" ]]; then
+            echo "::error::未找到 Dockerfile：$DOCKERFILE_PATH（路径相对于目标仓库根目录）"
+            exit 1
+          fi
+
+          echo "🔨 开始构建镜像 $IMAGE_NAME（平台：$PLATFORM，Dockerfile：$DOCKERFILE_PATH）"
+          if ! docker buildx build --platform "$PLATFORM" --load -f "$DOCKERFILE_PATH" -t "$IMAGE_NAME" .; then
+            echo "::error::镜像构建失败，请检查 Dockerfile 内容及其依赖的网络资源是否可访问"
+            echo "若日志中出现 'JavaScript heap out of memory'，是 Node.js 默认堆上限（约 4GB）不足："
+            echo "  可将 node_heap 输入参数调大（如 12GB），本 workflow 会自动向 Dockerfile 注入 ENV NODE_OPTIONS；"
+            echo "  Dockerfile 结构特殊时也可通过 hook_command 手动插入（示例见 README FAQ）"
+            exit 1
+          fi
+
+          # 确认镜像确实已进入本地镜像库（防止 --load 未生效等边缘情况）
+          if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+            echo "::error::镜像构建完成但未在本地镜像库中找到：$IMAGE_NAME"
+            exit 1
+          fi
+
+          # 记录镜像列表，供导出步骤统一消费
+          echo "$IMAGE_NAME" > "$GITHUB_WORKSPACE/$IMAGE_LIST_FILE"
+          # 记录 服务→镜像 映射（docker build 视为单服务，服务名取仓库名），供 GHCR 版 Compose 生成步骤消费
+          printf '%s\t%s\n' "$REPO_NAME" "$IMAGE_NAME" > "$GITHUB_WORKSPACE/$SERVICE_IMAGE_FILE"
+          echo "✅ 镜像构建完成：$IMAGE_NAME"
+
+      # ---------------------------------------------------------------
+      # Step 7B: 模式 compose pull —— 从 Compose 文件拉取全部镜像
+      #   不启动任何容器：先解析 Compose 得到镜像清单，
+      #   再逐个以 --platform 强制拉取目标架构，避免拉到 Runner 默认架构
+      # ---------------------------------------------------------------
+      - name: 拉取 Compose 镜像（build_mode=compose pull）
+        if: ${{ inputs.build_mode == 'compose pull' }}
+        working-directory: target-repo
+        env:
+          COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          # Compose 文件存在性检查（为空时使用默认值）
+          COMPOSE_FILE_PATH="${COMPOSE_FILE_PATH:-docker-compose.yml}"
+          if [[ ! -f "$COMPOSE_FILE_PATH" ]]; then
+            # 扩展名回退：.yml 与 .yaml 自动互查（用户给了 .yml 就找 .yaml，反之亦然）
+            ALT_PATH=""
+            case "$COMPOSE_FILE_PATH" in
+              *.yml)  ALT_PATH="${COMPOSE_FILE_PATH%.yml}.yaml" ;;
+              *.yaml) ALT_PATH="${COMPOSE_FILE_PATH%.yaml}.yml" ;;
+            esac
+            if [[ -n "$ALT_PATH" && -f "$ALT_PATH" ]]; then
+              echo "ℹ️ 未找到 $COMPOSE_FILE_PATH，已自动改用 $ALT_PATH"
+              COMPOSE_FILE_PATH="$ALT_PATH"
+            else
+              echo "::error::未找到 Compose 文件：$COMPOSE_FILE_PATH（路径相对于目标仓库根目录）"
+              if [[ -n "$ALT_PATH" ]]; then
+                echo "已扫描 .yml 与 .yaml 两种扩展名，均不存在：$COMPOSE_FILE_PATH / $ALT_PATH"
+              fi
+              exit 1
+            fi
+          fi
+
+          # 解析 Compose 文件（格式错误、引用了未定义的环境变量等会在这里失败）
+          # 失败时不再静默丢弃错误信息，而是：
+          #   1) 打印 Compose 原始错误，便于定位真实原因
+          #   2) 自动修复最常见的一类失败 —— 服务级 env_file 指向的文件不存在
+          #      （如 plane 的 env_file: ./apps/api/.env 不随仓库分发）：
+          #      同目录有 .env.example 则复制，否则生成空文件，然后重试解析
+          PARSE_ERR=""
+          CONFIG_JSON=""
+          for _attempt in 1 2 3 4 5; do
+            if PARSE_ERR=$(docker compose -f "$COMPOSE_FILE_PATH" config --format json 2>&1 >/dev/null); then
+              CONFIG_JSON=$(docker compose -f "$COMPOSE_FILE_PATH" config --format json)
+              break
+            fi
+            # 从错误信息中提取「env file <路径> not found」的缺失文件
+            MISSING_FILES=$(printf '%s\n' "$PARSE_ERR" | grep -oE 'env file [^ ]+ not found' | sed -E 's/^env file //; s/ not found$//' | sort -u || true)
+            if [[ -z "$MISSING_FILES" ]]; then
+              break
+            fi
+            REPAIRED=0
+            while IFS= read -r _mf; do
+              [[ -z "$_mf" ]] && continue
+              if [[ -f "$_mf" ]]; then
+                continue
+              fi
+              mkdir -p "$(dirname "$_mf")"
+              if [[ -f "$(dirname "$_mf")/.env.example" ]]; then
+                cp "$(dirname "$_mf")/.env.example" "$_mf"
+                echo "ℹ️ Compose 引用的 env 文件不存在，已根据同目录 .env.example 生成：$_mf"
+              else
+                : > "$_mf"
+                echo "ℹ️ Compose 引用的 env 文件不存在且无 .env.example，已生成空文件：$_mf"
+              fi
+              REPAIRED=1
+            done <<< "$MISSING_FILES"
+            # 本轮未能修复任何文件（文件已存在但仍失败），避免死循环
+            if [[ "$REPAIRED" -eq 0 ]]; then
+              break
+            fi
+          done
+          if [[ -z "$CONFIG_JSON" ]]; then
+            echo "::error::解析 Compose 文件失败：$COMPOSE_FILE_PATH。请确认文件格式正确、引用的环境变量已有定义或默认值"
+            echo "Compose 原始错误信息（排查真实原因看这里）："
+            printf '%s\n' "$PARSE_ERR" | sed 's/^/  /'
+            exit 1
+          fi
+
+          # 检测 build 型服务（声明了 build: 字段）：compose pull 只负责拉取，不执行构建
+          BUILD_SVCS=$(jq -r '.services | to_entries[] | select(.value.build != null) | .key' <<<"$CONFIG_JSON" | grep -v '^$' || true)
+          if [[ -n "$BUILD_SVCS" ]]; then
+            echo "::error::Compose 文件中存在 build 型服务（声明了 build: 字段）：$(echo "$BUILD_SVCS" | xargs)"
+            echo "compose pull 只负责拉取镜像，不执行构建。请任选其一："
+            echo "  1. 在目标仓库中为这些服务补充 image: 字段（指向 registry 中已存在的镜像）"
+            echo "  2. 改用 compose auto 模式（声明 image: 的服务拉取，仅声明 build: 的服务自动构建）"
+            echo "  3. 改用 docker build 模式（单一 Dockerfile）"
+            exit 1
+          fi
+
+          # 记录 服务→镜像 映射，供 GHCR 版 Compose 文件生成步骤消费
+          jq -r '.services | to_entries[] | select(.value.image != null) | "\(.key)\t\(.value.image)"' \
+            <<<"$CONFIG_JSON" > "$GITHUB_WORKSPACE/$SERVICE_IMAGE_FILE"
+
+          # 解析 Compose 文件中定义的全部镜像
+          if ! IMAGES=$(docker compose -f "$COMPOSE_FILE_PATH" config --images 2>/dev/null | sort -u); then
+            echo "::error::获取镜像清单失败：$COMPOSE_FILE_PATH"
+            exit 1
+          fi
+          if [[ -z "$IMAGES" ]]; then
+            echo "::error::Compose 文件中未解析到任何镜像，请检查 services.*.image 配置"
+            exit 1
+          fi
+
+          echo "📦 将拉取以下镜像（平台：$PLATFORM）："
+          printf '  - %s\n' $IMAGES
+
+          # 逐个强制拉取目标平台架构
+          while IFS= read -r img; do
+            [[ -z "$img" ]] && continue
+            if ! docker pull --platform "$PLATFORM" "$img"; then
+              echo "::error::拉取镜像失败：$img（平台：$PLATFORM）"
+              echo "可能原因：镜像名拼写错误 / 镜像不存在 / 该镜像不支持目标架构 / 私有镜像仓库未配置登录（见 README「私有镜像仓库支持」）"
+              exit 1
+            fi
+          done <<< "$IMAGES"
+
+          # 记录镜像列表，供导出步骤统一消费
+          echo "$IMAGES" > "$GITHUB_WORKSPACE/$IMAGE_LIST_FILE"
+          echo "✅ 全部镜像拉取完成"
+
+      # ---------------------------------------------------------------
+      # Step 7C: 模式 compose auto —— 按 Compose 服务自动「拉取 / 构建」
+      #   规则：服务声明了 build:                     → 用 Compose 构建该服务镜像
+      #         （即使同时声明 image: 也按构建处理 —— 本地已构建的镜像应优先复用，
+      #          云端无法保证该 image 已存在于 registry，故统一按 build 处理）
+      #         服务仅声明 image:（无 build:）          → 拉取该镜像
+      #   构建型镜像命名：服务声明了 image: 则用该值，否则由 Compose 按
+      #   <project>-<service> 命名；项目名优先取 Compose 文件顶层 name:，
+      #   否则取目标仓库名（避免默认落到克隆目录名 target-repo），
+      #   保证离线导入到目标服务器后镜像名可预期。
+      # ---------------------------------------------------------------
+      - name: 自动构建/拉取 Compose 镜像（build_mode=compose auto）
+        if: ${{ inputs.build_mode == 'compose auto' }}
+        working-directory: target-repo
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          # Compose 文件存在性检查（为空时使用默认值）
+          COMPOSE_FILE_PATH="${COMPOSE_FILE_PATH:-docker-compose.yml}"
+          if [[ ! -f "$COMPOSE_FILE_PATH" ]]; then
+            # 扩展名回退：.yml 与 .yaml 自动互查（用户给了 .yml 就找 .yaml，反之亦然）
+            ALT_PATH=""
+            case "$COMPOSE_FILE_PATH" in
+              *.yml)  ALT_PATH="${COMPOSE_FILE_PATH%.yml}.yaml" ;;
+              *.yaml) ALT_PATH="${COMPOSE_FILE_PATH%.yaml}.yml" ;;
+            esac
+            if [[ -n "$ALT_PATH" && -f "$ALT_PATH" ]]; then
+              echo "ℹ️ 未找到 $COMPOSE_FILE_PATH，已自动改用 $ALT_PATH"
+              COMPOSE_FILE_PATH="$ALT_PATH"
+            else
+              echo "::error::未找到 Compose 文件：$COMPOSE_FILE_PATH（路径相对于目标仓库根目录）"
+              if [[ -n "$ALT_PATH" ]]; then
+                echo "已扫描 .yml 与 .yaml 两种扩展名，均不存在：$COMPOSE_FILE_PATH / $ALT_PATH"
+              fi
+              exit 1
+            fi
+          fi
+
+          # 目标仓库名（用于 Compose 项目名，保证构建型镜像名可预期）
+          REPO_NAME="${REPO_URL%/}"
+          REPO_NAME="${REPO_NAME%.git}"
+          REPO_NAME="${REPO_NAME##*/}"
+          REPO_NAME="${REPO_NAME,,}"
+
+          # Compose 项目名：文件未显式声明顶层 name: 时，用仓库名替代默认的克隆目录名
+          if ! grep -Eq '^name[[:space:]]*:' "$COMPOSE_FILE_PATH"; then
+            export COMPOSE_PROJECT_NAME="$REPO_NAME"
+          fi
+
+          # 解析 Compose 文件（格式错误、引用了未定义的环境变量等会在这里失败）
+          # 失败时不再静默丢弃错误信息，而是：
+          #   1) 打印 Compose 原始错误，便于定位真实原因
+          #   2) 自动修复最常见的一类失败 —— 服务级 env_file 指向的文件不存在
+          #      （如 plane 的 env_file: ./apps/api/.env 不随仓库分发）：
+          #      同目录有 .env.example 则复制，否则生成空文件，然后重试解析
+          PARSE_ERR=""
+          CONFIG_JSON=""
+          for _attempt in 1 2 3 4 5; do
+            if PARSE_ERR=$(docker compose -f "$COMPOSE_FILE_PATH" config --format json 2>&1 >/dev/null); then
+              CONFIG_JSON=$(docker compose -f "$COMPOSE_FILE_PATH" config --format json)
+              break
+            fi
+            # 从错误信息中提取「env file <路径> not found」的缺失文件
+            MISSING_FILES=$(printf '%s\n' "$PARSE_ERR" | grep -oE 'env file [^ ]+ not found' | sed -E 's/^env file //; s/ not found$//' | sort -u || true)
+            if [[ -z "$MISSING_FILES" ]]; then
+              break
+            fi
+            REPAIRED=0
+            while IFS= read -r _mf; do
+              [[ -z "$_mf" ]] && continue
+              if [[ -f "$_mf" ]]; then
+                continue
+              fi
+              mkdir -p "$(dirname "$_mf")"
+              if [[ -f "$(dirname "$_mf")/.env.example" ]]; then
+                cp "$(dirname "$_mf")/.env.example" "$_mf"
+                echo "ℹ️ Compose 引用的 env 文件不存在，已根据同目录 .env.example 生成：$_mf"
+              else
+                : > "$_mf"
+                echo "ℹ️ Compose 引用的 env 文件不存在且无 .env.example，已生成空文件：$_mf"
+              fi
+              REPAIRED=1
+            done <<< "$MISSING_FILES"
+            # 本轮未能修复任何文件（文件已存在但仍失败），避免死循环
+            if [[ "$REPAIRED" -eq 0 ]]; then
+              break
+            fi
+          done
+          if [[ -z "$CONFIG_JSON" ]]; then
+            echo "::error::解析 Compose 文件失败：$COMPOSE_FILE_PATH。请确认文件格式正确、引用的环境变量已有定义或默认值"
+            echo "Compose 原始错误信息（排查真实原因看这里）："
+            printf '%s\n' "$PARSE_ERR" | sed 's/^/  /'
+            exit 1
+          fi
+
+          # 项目名（与 Compose 构建时使用的名称保持一致）
+          PROJECT_NAME="$(jq -r '.name // empty' <<<"$CONFIG_JSON")"
+          PROJECT_NAME="${PROJECT_NAME:-$REPO_NAME}"
+
+          # 分类：声明 build: 的服务 → 构建（即使同时声明 image: 也按构建处理）；
+          #       仅声明 image:（无 build:）的服务 → 拉取
+          mapfile -t PULL_IMAGES < <(jq -r '.services[] | select(.image != null and .build == null) | .image' <<<"$CONFIG_JSON" | sort -u | grep -v '^$' || true)
+          mapfile -t BUILD_SVCS < <(jq -r '.services | to_entries[] | select(.value.build != null) | .key' <<<"$CONFIG_JSON" | grep -v '^$' || true)
+
+          if [[ ${#PULL_IMAGES[@]} -eq 0 && ${#BUILD_SVCS[@]} -eq 0 ]]; then
+            echo "::error::Compose 文件中未解析到任何镜像服务，请检查 services.*.image / services.*.build 配置"
+            exit 1
+          fi
+
+          echo "📥 拉取型服务镜像（仅声明 image，无 build）：${PULL_IMAGES[*]:-无}"
+          echo "🔨 构建型服务（声明了 build，含同时声明 image 的服务）：${BUILD_SVCS[*]:-无}"
+
+          # 1) 拉取：逐个以 --platform 强制拉取目标架构
+          for img in "${PULL_IMAGES[@]}"; do
+            [[ -z "$img" ]] && continue
+            if ! docker pull --platform "$PLATFORM" "$img"; then
+              echo "::error::拉取镜像失败：$img（平台：$PLATFORM）"
+              echo "可能原因：镜像名拼写错误 / 镜像不存在 / 该镜像不支持目标架构 / 私有镜像仓库未配置登录（见 README「私有镜像仓库支持」）"
+              exit 1
+            fi
+          done
+
+          # 2) 构建：交给 Compose 处理 context/dockerfile/args/target；
+          #    声明了 image: 的构建型服务按该值命名，否则按 <project>-<service> 命名
+          if [[ ${#BUILD_SVCS[@]} -gt 0 ]]; then
+            echo "🔨 开始构建构建型服务镜像（平台：$PLATFORM）：${BUILD_SVCS[*]}"
+            if ! DOCKER_DEFAULT_PLATFORM="$PLATFORM" docker compose -f "$COMPOSE_FILE_PATH" build "${BUILD_SVCS[@]}"; then
+              echo "::error::构建型服务镜像构建失败，请检查对应服务的 build 配置及其依赖的网络资源是否可访问"
+              echo "若日志中出现 'JavaScript heap out of memory'，是 Node.js 默认堆上限（约 4GB）不足："
+              echo "  可将 node_heap 输入参数调大（如 12GB），本 workflow 会自动向构建型服务的 Dockerfile 注入 ENV NODE_OPTIONS；"
+              echo "  Dockerfile 结构特殊时也可通过 hook_command 手动插入（示例见 README FAQ）"
+              exit 1
+            fi
+          fi
+
+          # 记录 服务→镜像 映射（覆盖全部服务：构建型无 image: 的按 <project>-<service> 补齐），
+          # 供 GHCR 版 Compose 文件生成步骤消费
+          : > "$GITHUB_WORKSPACE/$SERVICE_IMAGE_FILE"
+          while IFS= read -r _svc; do
+            [[ -z "$_svc" ]] && continue
+            _svc_image="$(jq -r --arg s "$_svc" '.services[$s].image // empty' <<<"$CONFIG_JSON")"
+            printf '%s\t%s\n' "$_svc" "${_svc_image:-${PROJECT_NAME}-${_svc}}" >> "$GITHUB_WORKSPACE/$SERVICE_IMAGE_FILE"
+          done < <(jq -r '.services | keys[]' <<<"$CONFIG_JSON")
+
+          # 汇总镜像清单：拉取型用 image:；构建型若声明了 image: 则用该值，
+          # 否则用 Compose 的 <project>-<service> 命名
+          {
+            printf '%s\n' "${PULL_IMAGES[@]}"
+            for svc in "${BUILD_SVCS[@]}"; do
+              [[ -z "$svc" ]] && continue
+              svc_image="$(jq -r --arg s "$svc" '.services[$s].image // empty' <<<"$CONFIG_JSON")"
+              echo "${svc_image:-${PROJECT_NAME}-${svc}}"
+            done
+          } | grep -v '^[[:space:]]*$' | sort -u > "$GITHUB_WORKSPACE/$IMAGE_LIST_FILE"
+
+          if [[ ! -s "$GITHUB_WORKSPACE/$IMAGE_LIST_FILE" ]]; then
+            echo "::error::镜像清单为空，无法导出"
+            exit 1
+          fi
+
+          echo "✅ Compose auto 完成，镜像清单："
+          cat "$GITHUB_WORKSPACE/$IMAGE_LIST_FILE"
+
+      # ---------------------------------------------------------------
+      # Step 8: 验证镜像架构
+      #   逐一检查本地镜像的 Os/Architecture 是否与目标平台一致，
+      #   防止拉错/构建错架构的镜像被打进离线包（元数据为 unknown 的
+      #   老镜像跳过强校验，仅告警）
+      # ---------------------------------------------------------------
+      - name: 验证镜像架构
+        env:
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! -s "$IMAGE_LIST_FILE" ]]; then
+            echo "::error::未找到镜像列表文件 $IMAGE_LIST_FILE，前置步骤可能未执行"
+            exit 1
+          fi
+
+          PLATFORM_OS="${PLATFORM%%/*}"
+          PLATFORM_ARCH="${PLATFORM##*/}"
+          MISMATCH=0
+
+          while IFS= read -r img; do
+            [[ -z "$img" ]] && continue
+            actual=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$img" 2>/dev/null) || {
+              echo "::error::镜像在本地镜像库中不存在：$img"
+              exit 1
+            }
+            if [[ "$actual" == "$PLATFORM_OS/$PLATFORM_ARCH" ]]; then
+              echo "✅ $img → $actual"
+            elif [[ "$actual" == *"/unknown" || "$actual" == "unknown/unknown" ]]; then
+              echo "⚠️ $img 架构元数据为 $actual（常见于较老的镜像），跳过强校验"
+            else
+              echo "::error::镜像 $img 的架构为 $actual，与目标平台 $PLATFORM 不符"
+              MISMATCH=1
+            fi
+          done < "$IMAGE_LIST_FILE"
+
+          if [[ "$MISMATCH" -ne 0 ]]; then
+            echo "::error::存在架构不匹配的镜像，已终止后续步骤。请检查镜像是否支持目标平台"
+            exit 1
+          fi
+          echo "✅ 全部镜像架构校验通过"
+
+      # ---------------------------------------------------------------
+      # Step 8B: 登录 GHCR（仅 delivery_mode=push）
+      #   使用内置 GITHUB_TOKEN（需 packages: write 权限，见文件顶部 permissions）
+      # ---------------------------------------------------------------
+      - name: 登录 GHCR（delivery_mode=push）
+        if: ${{ inputs.delivery_mode == 'push' }}
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          echo "🔐 登录 GHCR：$GHCR_REGISTRY（用户：$GHCR_ACTOR）"
+          if ! echo "$GHCR_TOKEN" | docker login "$GHCR_REGISTRY" --username "$GHCR_ACTOR" --password-stdin; then
+            echo "::error::登录 GHCR 失败。请确认："
+            echo "  1. workflow 已声明 packages: write 权限"
+            echo "  2. 组织/仓库未禁止 GITHUB_TOKEN 创建包（Settings → Actions → General → Workflow permissions）"
+            exit 1
+          fi
+          echo "GHCR_LOGGED_IN=1" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # Step 8C: 推送镜像到 GHCR（仅 delivery_mode=push）
+      #   将 IMAGE_LIST_FILE 中的全部镜像重新打标签为
+      #   ghcr.io/<owner>/<repo>/<镜像名>:<tag> 并逐个推送；
+      #   推送结果写入 GHCR_PUSHED_FILE，供摘要步骤展示拉取方式
+      # ---------------------------------------------------------------
+      - name: 推送镜像到 GHCR（delivery_mode=push）
+        if: ${{ inputs.delivery_mode == 'push' }}
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! -s "$IMAGE_LIST_FILE" ]]; then
+            echo "::error::未找到镜像列表文件 $IMAGE_LIST_FILE，前置步骤可能未执行"
+            exit 1
+          fi
+
+          # GHCR 路径要求全小写
+          OWNER="${GHCR_OWNER,,}"
+          REPO_NAME="${REPO_URL%/}"
+          REPO_NAME="${REPO_NAME%.git}"
+          REPO_NAME="${REPO_NAME##*/}"
+          REPO_NAME="${REPO_NAME,,}"
+          if [[ -z "$OWNER" || -z "$REPO_NAME" ]]; then
+            echo "::error::无法解析 GHCR 命名空间（owner=$OWNER，repo=$REPO_NAME）"
+            exit 1
+          fi
+
+          NAMESPACE="${GHCR_REGISTRY}/${OWNER}/${REPO_NAME}"
+
+          mapfile -t IMAGES < <(grep -v '^[[:space:]]*$' "$IMAGE_LIST_FILE" || true)
+          if [[ ${#IMAGES[@]} -eq 0 ]]; then
+            echo "::error::镜像列表为空，无法推送"
+            exit 1
+          fi
+
+          : > "$GITHUB_WORKSPACE/$GHCR_PUSHED_FILE"
+
+          echo "📤 推送 ${#IMAGES[@]} 个镜像到 $NAMESPACE/"
+          for img in "${IMAGES[@]}"; do
+            # 取镜像基名（去掉 registry 与命名空间，如 docker.io/library/redis:7 → redis:7）
+            base="${img##*/}"
+            base="${base%%@*}"                              # 去掉可能的 digest（name@sha256:...）
+            [[ "$base" != *:* ]] && base="${base}:latest"   # 无 tag 时补 latest
+            target="${NAMESPACE}/${base}"
+
+            echo "🏷️  ${img}  →  ${target}"
+            if ! docker tag "$img" "$target"; then
+              echo "::error::打标签失败：$img → $target"
+              exit 1
+            fi
+            if ! docker push "$target"; then
+              echo "::error::推送镜像失败：$target"
+              echo "可能原因：GITHUB_TOKEN 缺少 packages: write 权限 / 命名空间无权限 / 网络异常"
+              exit 1
+            fi
+            printf '%s\t%s\n' "$img" "$target" >> "$GITHUB_WORKSPACE/$GHCR_PUSHED_FILE"
+          done
+
+          echo "GHCR_NAMESPACE=$NAMESPACE" >> "$GITHUB_ENV"
+          echo "GHCR_PUSHED_COUNT=${#IMAGES[@]}" >> "$GITHUB_ENV"
+          echo "✅ 已推送 ${#IMAGES[@]} 个镜像到 $NAMESPACE/"
+
+      # ---------------------------------------------------------------
+      # Step 8D: 生成 GHCR 版 Compose 文件（仅 delivery_mode=push）
+      #   push 模式下镜像已重命名为 ghcr.io/<owner>/<repo>/... 前缀，
+      #   目标仓库自带的 Compose 文件仍指向原始镜像名（或 build: 段），
+      #   用户拿到后无法直接使用。本步骤基于「服务→本地镜像」映射与
+      #   「本地镜像→GHCR 目标名」推送记录，生成 docker-compose-ghcr.yml：
+      #     - 所有服务的 image: 替换为对应的 GHCR 镜像地址
+      #     - 移除 services.*.build 段（镜像已在 GHCR，无需再构建）
+      #   docker build 模式没有 Compose 文件，则生成仅含单服务的最小文件。
+      #   生成后会用 docker compose config 校验，确保交付文件可用。
+      # ---------------------------------------------------------------
+      - name: 生成 GHCR 版 Compose 文件（delivery_mode=push）
+        if: ${{ inputs.delivery_mode == 'push' }}
+        env:
+          BUILD_MODE: ${{ inputs.build_mode }}
+          COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
+          REPO_URL: ${{ inputs.repo_url }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PYEOF'
+          import os
+          import subprocess
+          import sys
+
+          try:
+              import yaml
+          except ImportError:  # runner 一般预装 PyYAML，兜底安装
+              subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "pyyaml"])
+              import yaml
+
+          ws = os.environ["GITHUB_WORKSPACE"]
+          svc_file = os.path.join(ws, os.environ["SERVICE_IMAGE_FILE"])
+          push_file = os.path.join(ws, os.environ["GHCR_PUSHED_FILE"])
+          build_mode = os.environ["BUILD_MODE"]
+          compose_input = (os.environ.get("COMPOSE_FILE_PATH") or "docker-compose.yml").strip() or "docker-compose.yml"
+          repo_url = os.environ["REPO_URL"]
+          target_dir = os.path.join(ws, "target-repo")
+          out_name = "docker-compose-ghcr.yml"
+          out_path = os.path.join(target_dir, out_name)
+
+          # 1) 服务 → 本地镜像
+          svc_img = {}
+          with open(svc_file, encoding="utf-8") as f:
+              for line in f:
+                  line = line.rstrip("\n")
+                  if not line or "\t" not in line:
+                      continue
+                  svc, img = line.split("\t", 1)
+                  svc_img[svc] = img
+
+          # 2) 本地镜像 → GHCR 目标名
+          img_ghcr = {}
+          with open(push_file, encoding="utf-8") as f:
+              for line in f:
+                  line = line.rstrip("\n")
+                  if not line or "\t" not in line:
+                      continue
+                  src, dst = line.split("\t", 1)
+                  img_ghcr[src] = dst
+
+          if not svc_img or not img_ghcr:
+              print("::error::服务→镜像映射或推送记录为空，无法生成 GHCR 版 Compose 文件")
+              sys.exit(1)
+
+          replaced, untouched = [], []
+          doc = None
+
+          if build_mode != "docker build":
+              # 3a) Compose 模式：读取原始 Compose 文件（与拉取步骤相同的 .yml/.yaml 回退逻辑）
+              cand = os.path.join(target_dir, compose_input)
+              if not os.path.isfile(cand):
+                  alt = compose_input[:-4] + (".yml" if compose_input.endswith(".yaml") else ".yaml")
+                  alt_path = os.path.join(target_dir, alt)
+                  if os.path.isfile(alt_path):
+                      cand = alt_path
+
+              if os.path.isfile(cand):
+                  with open(cand, encoding="utf-8") as f:
+                      doc = yaml.safe_load(f) or {}
+                  services = doc.get("services") or {}
+                  if not services:
+                      print("::error::原始 Compose 文件中未找到 services 定义：%s" % cand)
+                      sys.exit(1)
+                  for svc, node in services.items():
+                      if not isinstance(node, dict):
+                          continue
+                      # YAML 1.1 会把裸写的 no/yes/on/off 解析为布尔值，
+                      # 而 Compose 的 restart 要求字符串（如 restart: no），需还原
+                      rv = node.get("restart")
+                      if rv is False:
+                          node["restart"] = "no"
+                      elif rv is True:
+                          node["restart"] = "always"
+                      local = svc_img.get(svc)
+                      ghcr_name = img_ghcr.get(local) if local else None
+                      if ghcr_name:
+                          node["image"] = ghcr_name
+                          node.pop("build", None)
+                          replaced.append(svc)
+                      elif "build" in node:
+                          # 该服务镜像未出现在推送记录中，保留原样并告警
+                          untouched.append(svc)
+                      else:
+                          untouched.append(svc)
+
+          if doc is None:
+              # 3b) docker build 模式（或 Compose 文件缺失）：生成仅含单服务的最小文件
+              svc, local = next(iter(svc_img.items()))
+              ghcr_name = img_ghcr.get(local)
+              if not ghcr_name:
+                  print("::error::镜像 %s 未找到对应的 GHCR 推送记录" % local)
+                  sys.exit(1)
+              doc = {"services": {svc: {"image": ghcr_name}}}
+              replaced.append(svc)
+
+          # 4) 写出（保留键序，便于阅读 diff）
+          with open(out_path, "w", encoding="utf-8") as f:
+              yaml.safe_dump(doc, f, sort_keys=False, allow_unicode=True, default_flow_style=False)
+
+          print("已生成 %s" % out_path)
+          print("  已替换为 GHCR 地址的服务：%s" % (", ".join(replaced) or "无"))
+          if untouched:
+              print("  ⚠️ 未在推送记录中找到对应镜像、保留原样的服务：%s" % ", ".join(untouched))
+          PYEOF
+
+          # 5) 校验生成文件的 Compose 语法可解析（在 target-repo 内执行，env_file 相对路径才可解析）
+          if ! (cd target-repo && docker compose -f docker-compose-ghcr.yml config --quiet); then
+            echo "::error::生成的 docker-compose-ghcr.yml 校验失败"
+            echo "请检查上方 Compose 校验输出。注意：该文件引用的 env_file（如 .env）需与目标服务器上的实际目录结构一致"
+            exit 1
+          fi
+          echo "✅ docker-compose-ghcr.yml 生成并校验通过"
+          echo "--------------------------------------------------"
+          cat target-repo/docker-compose-ghcr.yml
+
+      - name: 上传 GHCR 版 Compose 文件（delivery_mode=push）
+        if: ${{ inputs.delivery_mode == 'push' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-compose-ghcr
+          path: target-repo/docker-compose-ghcr.yml
+          retention-days: 14
+          if-no-files-found: error
+
+      # ---------------------------------------------------------------
+      # Step 9: docker save 导出全部镜像，并压缩为 TGZ
+      #   文件名：<repo-name>_docker-images_<platform>_<yyyymmdd-HHMMSS>.tgz
+      #   Artifact 命名：与文件名同基名（不含 .tgz 扩展名）
+      #   repo-name 取自 repo_url 的项目名；时间戳使用 Asia/Shanghai 时区
+      # ---------------------------------------------------------------
+      - name: 导出镜像并压缩为 TGZ（delivery_mode=pack）
+        if: ${{ inputs.delivery_mode == 'pack' }}
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          # 从 repo_url 提取项目名：去掉可选结尾斜杠与 .git 后缀，取最后一段路径
+          REPO_NAME="${REPO_URL%/}"
+          REPO_NAME="${REPO_NAME%.git}"
+          REPO_NAME="${REPO_NAME##*/}"
+          if [[ -z "$REPO_NAME" ]]; then
+            echo "::error::无法从 repo_url 解析出项目名：$REPO_URL"
+            exit 1
+          fi
+
+          # linux/amd64 -> linux-amd64（文件名中不能包含 /）
+          PLATFORM_TAG="${PLATFORM//\//-}"
+          # 北京时间戳，形如 20261009-153045
+          TIMESTAMP="$(TZ='Asia/Shanghai' date +%Y%m%d-%H%M%S)"
+
+          ARTIFACT_NAME="${REPO_NAME}_docker-images_${PLATFORM_TAG}_${TIMESTAMP}"
+          TGZ_NAME="${ARTIFACT_NAME}.tgz"
+
+          if [[ ! -s "$IMAGE_LIST_FILE" ]]; then
+            echo "::error::未找到镜像列表文件 $IMAGE_LIST_FILE，前置步骤可能未执行"
+            exit 1
+          fi
+
+          mkdir -p dist
+          mapfile -t IMAGES < <(grep -v '^[[:space:]]*$' "$IMAGE_LIST_FILE" || true)
+
+          if [[ ${#IMAGES[@]} -eq 0 ]]; then
+            echo "::error::镜像列表为空，无法导出"
+            exit 1
+          fi
+
+          echo "📤 导出以下 ${#IMAGES[@]} 个镜像："
+          printf '  - %s\n' "${IMAGES[@]}"
+
+          if ! docker save "${IMAGES[@]}" | gzip > "dist/$TGZ_NAME"; then
+            echo "::error::docker save / 压缩失败"
+            exit 1
+          fi
+
+          if [[ ! -s "dist/$TGZ_NAME" ]]; then
+            echo "::error::TGZ 产物为空文件：dist/$TGZ_NAME"
+            exit 1
+          fi
+
+          TGZ_SHA256=$(sha256sum "dist/$TGZ_NAME" | awk '{print $1}')
+          TGZ_SIZE=$(du -h "dist/$TGZ_NAME" | cut -f1)
+
+          {
+            echo "ARTIFACT_NAME=$ARTIFACT_NAME"
+            echo "TGZ_NAME=$TGZ_NAME"
+            echo "TGZ_SHA256=$TGZ_SHA256"
+            echo "TGZ_SIZE=$TGZ_SIZE"
+          } >> "$GITHUB_ENV"
+
+          echo "✅ 打包完成：dist/$TGZ_NAME（${TGZ_SIZE}，SHA256：${TGZ_SHA256}）"
+          ls -lh dist/
+
+      # ---------------------------------------------------------------
+      # Step 10: 上传 TGZ Artifact
+      #   每次运行的产物通过时间戳区分，互不覆盖
+      #   注：Artifact 下载后为 zip 包，解压即得到 TGZ 文件
+      # ---------------------------------------------------------------
+      - name: 上传 Artifact（delivery_mode=pack）
+        if: ${{ inputs.delivery_mode == 'pack' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/${{ env.TGZ_NAME }}
+          retention-days: 14
+          if-no-files-found: error
+
+      # ---------------------------------------------------------------
+      # Step 11: 输出运行摘要（显示在运行页面底部的 Summary 区域）
+      #   通用：配置参数、Runner 架构与环境（内核架构/CPU/内存/磁盘、
+      #   原生执行或 QEMU 模拟）、GitHub Ripple Hotlink（可点击仓库链接）
+      #   delivery_mode=pack：产物文件名/大小/SHA256、镜像清单（架构+大小）、导入方法
+      #   delivery_mode=push：GHCR 命名空间、镜像对照表、拉取命令、国内加速代理
+      #   失败时给出排查指引
+      # ---------------------------------------------------------------
+      - name: 输出运行摘要
+        if: ${{ always() }}
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          PLATFORM: ${{ inputs.platform }}
+          BUILD_MODE: ${{ inputs.build_mode }}
+          DELIVERY_MODE: ${{ inputs.delivery_mode }}
+          DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
+          COMPOSE_FILE_PATH: ${{ inputs.compose_file_path }}
+          INPUT_IMAGE_NAME: ${{ inputs.image_name }}
+          HOOK_COMMAND: ${{ inputs.hook_command }}
+          NODE_HEAP: ${{ inputs.node_heap }}
+          RUNNER_ARCH: ${{ runner.arch }}
+          RUN_NUMBER: ${{ github.run_number }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+
+          # 优先使用构建阶段解析出的镜像名（含默认值），否则回退到原始输入
+          IMAGE_NAME="${IMAGE_NAME:-$INPUT_IMAGE_NAME}"
+
+          # GitHub 仓库页链接：去掉结尾斜杠与 .git 后缀，作为 Summary 中的可点击 hotlink
+          REPO_LINK="${REPO_URL%/}"
+          REPO_LINK="${REPO_LINK%.git}"
+
+          # 源仓库名与 owner（小写），用于拼出 GHCR 命名空间
+          GHCR_OWNER_LOWER="${GHCR_OWNER,,}"
+          REPO_NAME_SUM="${REPO_URL%/}"
+          REPO_NAME_SUM="${REPO_NAME_SUM%.git}"
+          REPO_NAME_SUM="${REPO_NAME_SUM##*/}"
+          REPO_NAME_LOWER="${REPO_NAME_SUM,,}"
+
+          # Runner 架构信息：内核架构、GitHub runner.arch 与执行模式判定
+          #   runner.arch 与目标平台架构一致 → 原生执行（ARM Runner 特性生效）
+          #   不一致（如 x86 Runner 构建 arm64）→ QEMU 模拟兜底，速度较慢
+          KERNEL_ARCH="$(uname -m)"
+          PLATFORM_ARCH="${PLATFORM##*/}"
+          case "$PLATFORM_ARCH" in
+            amd64) PLATFORM_ARCH_LABEL="X64" ;;
+            arm64) PLATFORM_ARCH_LABEL="ARM64" ;;
+            *)     PLATFORM_ARCH_LABEL="$PLATFORM_ARCH" ;;
+          esac
+          if [[ "$RUNNER_ARCH" == "$PLATFORM_ARCH_LABEL" ]]; then
+            EXEC_MODE="与目标平台一致，**原生执行**（无模拟开销）"
+          else
+            EXEC_MODE="与目标平台不一致，**QEMU 模拟兜底**（速度较慢）"
+          fi
+          # Runner 软硬件概览（GitHub 托管 Runner 预置 ImageOS / ImageVersion 环境变量）
+          CPU_COUNT="$(nproc)"
+          MEM_TOTAL="$(free -h | awk '/^Mem:/ {print $2}')"
+          DISK_AVAIL="$(df -h "$GITHUB_WORKSPACE" | awk 'NR==2 {print $4}')"
+
+          # 取镜像大小（人类可读），镜像已不存在时返回 "-"
+          img_size() {
+            local bytes
+            if bytes=$(docker image inspect --format '{{.Size}}' "$1" 2>/dev/null); then
+              numfmt --to=iec --suffix=B "$bytes" 2>/dev/null || echo "${bytes}B"
+            else
+              echo "-"
+            fi
+          }
+
+          # 取镜像架构，镜像已不存在时返回 "-"
+          img_arch() {
+            docker image inspect --format '{{.Os}}/{{.Architecture}}' "$1" 2>/dev/null || echo "-"
+          }
+
+          {
+            echo "## 📦 镜像构建打包摘要"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 运行编号 | #${RUN_NUMBER} |"
+            echo "| 目标仓库 | \`${REPO_URL}\` |"
+            echo "| GitHub Ripple Hotlink | <a href=\"${REPO_LINK}\" target=\"_blank\" rel=\"noopener noreferrer\">${REPO_LINK}</a> |"
+            echo "| 模式 | \`${BUILD_MODE}\` |"
+            echo "| 交付方式 | \`${DELIVERY_MODE}\` |"
+            echo "| 目标平台 | \`${PLATFORM}\` |"
+            echo "| Runner 架构 | \`${RUNNER_ARCH}\`（内核 \`${KERNEL_ARCH}\`）—— ${EXEC_MODE} |"
+            echo "| Runner 环境 | \`${ImageOS:-unknown} ${ImageVersion:-}\` · CPU ${CPU_COUNT} 核 · 内存 ${MEM_TOTAL} · 磁盘可用 ${DISK_AVAIL} |"
+            echo "| Node.js 堆上限 | \`${NODE_HEAP:-4GB}\` |"
+            if [[ "$BUILD_MODE" == "docker build" ]]; then
+              echo "| Dockerfile | \`${DOCKERFILE_PATH:-Dockerfile}\` |"
+              echo "| 镜像名称 | \`${IMAGE_NAME}\` |"
+            else
+              echo "| Compose 文件 | \`${COMPOSE_FILE_PATH:-docker-compose.yml}\` |"
+            fi
+            echo "| 运行状态 | \`${JOB_STATUS}\` |"
+            if [[ -n "$HOOK_COMMAND" ]]; then
+              echo "| 钩子命令 | \`$HOOK_COMMAND\` |"
+            else
+              echo "| 钩子命令 | （未执行） |"
+            fi
+            echo ""
+
+            if [[ "$JOB_STATUS" == "success" && "$DELIVERY_MODE" == "pack" && -n "${TGZ_NAME:-}" && -f "dist/$TGZ_NAME" ]]; then
+              echo "### ✅ 产出 Artifact"
+              echo ""
+              echo "| 项目 | 值 |"
+              echo "|---|---|"
+              echo "| Artifact 名称 | \`${ARTIFACT_NAME}\` |"
+              echo "| 文件名 | \`${TGZ_NAME}\` |"
+              echo "| 大小 | ${TGZ_SIZE:-?} |"
+              echo "| SHA256 | \`${TGZ_SHA256:-?}\` |"
+
+              if [[ -f "$IMAGE_LIST_FILE" ]]; then
+                mapfile -t IMAGES < <(grep -v '^[[:space:]]*$' "$IMAGE_LIST_FILE" || true)
+                echo "| 包含镜像数 | ${#IMAGES[@]} |"
+                echo ""
+                echo "### 镜像清单"
+                echo ""
+                echo "| 镜像 | 架构 | 大小 |"
+                echo "|---|---|---|"
+                for img in "${IMAGES[@]}"; do
+                  echo "| \`${img}\` | $(img_arch "$img") | $(img_size "$img") |"
+                done
+              fi
+              echo ""
+              echo "### 目标服务器导入方法"
+              echo ""
+              echo "从本次运行页面的 **Artifacts** 区域下载 \`${ARTIFACT_NAME}\`（下载得到 zip，解压即为本 TGZ 文件）："
+              echo ""
+              echo '```bash'
+              echo "# 1. 校验完整性（可选，SHA256 见上表）"
+              echo "echo \"${TGZ_SHA256:-<sha256>}  ${TGZ_NAME}\" | sha256sum -c"
+              echo ""
+              echo "# 2. 导入全部镜像"
+              echo "docker load -i <(gunzip -c ${TGZ_NAME})"
+              echo ""
+              echo "# 3. 验证导入结果"
+              echo "docker images"
+              echo '```'
+            elif [[ "$JOB_STATUS" == "success" && "$DELIVERY_MODE" == "push" ]]; then
+              echo "### 🚀 镜像已推送到 GHCR"
+              echo ""
+              echo "| 项目 | 值 |"
+              echo "|---|---|"
+              echo "| GHCR 命名空间 | \`${GHCR_NAMESPACE:-${GHCR_REGISTRY}/${GHCR_OWNER_LOWER}/${REPO_NAME_LOWER}}\` |"
+              echo "| 推送镜像数 | ${GHCR_PUSHED_COUNT:-?} |"
+              echo "| Compose 文件 Artifact | \`docker-compose-ghcr\`（内含 docker-compose-ghcr.yml，image 已替换为 GHCR 地址） |"
+              echo ""
+
+              if [[ -f "$GHCR_PUSHED_FILE" && -s "$GHCR_PUSHED_FILE" ]]; then
+                echo "#### 镜像清单（本地 → GHCR）"
+                echo ""
+                echo "| 本地镜像 | GHCR 镜像 |"
+                echo "|---|---|"
+                while IFS=$'\t' read -r src dst; do
+                  [[ -z "$src" ]] && continue
+                  echo "| \`${src}\` | \`${dst}\` |"
+                done < "$GHCR_PUSHED_FILE"
+                echo ""
+              fi
+
+              echo "#### 如何拉取"
+              echo ""
+              echo "> 若目标仓库/包为**私有**，拉取前需先登录；公开包可直接拉取，无需登录。"
+              echo ""
+              echo '```bash'
+              echo "# 1. 登录 GHCR（仅私有包需要；密码使用具备 read:packages 权限的 PAT）"
+              echo "echo \"<YOUR_PAT>\" | docker login ${GHCR_REGISTRY} -u <YOUR_GITHUB_USERNAME> --password-stdin"
+              echo ""
+              echo "# 2. 拉取镜像（完整镜像名见上方清单）"
+              echo "docker pull ${GHCR_NAMESPACE:-${GHCR_REGISTRY}/${GHCR_OWNER_LOWER}/${REPO_NAME_LOWER}}/<镜像名>:<tag>"
+              echo '```'
+              echo ""
+              echo "#### 一键使用 Compose 启动（无需手改镜像名）"
+              echo ""
+              echo "从本次运行页面的 **Artifacts** 区域下载 \`docker-compose-ghcr\`（解压得到 \`docker-compose-ghcr.yml\`），"
+              echo "其中所有服务的 \`image:\` 已替换为对应的 GHCR 镜像地址、\`build:\` 段已移除。"
+              echo "将其放到目标仓库的 Compose 文件同目录（env_file 引用的 .env 需按项目要求提前准备好），然后："
+              echo ""
+              echo '```bash'
+              echo "docker compose -f docker-compose-ghcr.yml up -d"
+              echo '```'
+              echo ""
+              echo "#### 国内加速代理直连 GHCR"
+              echo ""
+              echo "国内网络直连 \`ghcr.io\` 可能较慢，可将镜像地址中的域名 \`ghcr.io\` 替换为下列任一加速代理（镜像名其余部分保持不变），即可直连拉取："
+              echo ""
+              echo "| 加速代理 | 域名 |"
+              echo "|---|---|"
+              echo "| 南京大学镜像 | \`ghcr.nju.edu.cn\` |"
+              echo "| 毫秒镜像 | \`ghcr.1ms.run\` |"
+              echo ""
+              echo "示例（以下以清单中第一个镜像为例）："
+              echo ""
+              echo '```bash'
+              FIRST_DST="$(head -n 1 "$GHCR_PUSHED_FILE" 2>/dev/null | cut -f2 || true)"
+              if [[ -n "$FIRST_DST" ]]; then
+                PROXY_PATH="${FIRST_DST#${GHCR_REGISTRY}/}"
+                echo "docker pull ghcr.nju.edu.cn/${PROXY_PATH}"
+                echo "docker pull ghcr.1ms.run/${PROXY_PATH}"
+              else
+                echo "docker pull ghcr.nju.edu.cn/<owner>/<repo>/<镜像名>:<tag>"
+                echo "docker pull ghcr.1ms.run/<owner>/<repo>/<镜像名>:<tag>"
+              fi
+              echo '```'
+            else
+              echo "### ⚠️ 本次运行未产生预期结果"
+              echo ""
+              echo "运行状态：\`${JOB_STATUS}\`（交付方式：\`${DELIVERY_MODE}\`）。请查看上方失败步骤的日志定位原因，常见问题："
+              echo ""
+              echo "- 参数校验失败 → 检查 repo_url 地址格式、image_name 是否为 name:tag 形式"
+              echo "- 克隆失败 → 检查仓库地址；私有仓库需配置 \`CLONE_PAT\` secret"
+              echo "- 构建失败 → 检查 Dockerfile 及其依赖的网络资源；arm64 已使用原生 ARM Runner 构建（若仓库无私有 ARM Runner 权限会回退 QEMU 模拟，速度较慢属正常）"
+              echo "- 构建报 \`JavaScript heap out of memory\` → Node.js 默认堆上限不足，重新运行时把 \`node_heap\` 参数调大（本 workflow 会自动注入），或用 \`hook_command\` 手动打补丁（见 README FAQ）"
+              echo "- 拉取失败 → 检查镜像名拼写、目标架构支持；私有镜像仓库需配置登录 secrets"
+              if [[ "$DELIVERY_MODE" == "push" ]]; then
+                echo "- 推送失败 → 检查 workflow 是否具备 \`packages: write\` 权限、GHCR 登录是否成功"
+              else
+                echo "- 打包失败 → 检查镜像架构校验是否通过、磁盘空间是否充足"
+              fi
+              echo ""
+              echo "更多排查指引见仓库 README 的 **FAQ 与故障排查** 章节。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------
+      # Step 12: 登出镜像仓库（若曾登录，尽力而为）
+      #   含 GHCR（delivery_mode=push）与自定义私有镜像仓库（REGISTRY_* secrets）
+      # ---------------------------------------------------------------
+      - name: 登出镜像仓库
+        if: ${{ always() && (env.REGISTRY_LOGGED_IN == '1' || env.GHCR_LOGGED_IN == '1') }}
+        continue-on-error: true
+        run: |
+          if [[ "${GHCR_LOGGED_IN:-}" == "1" ]]; then
+            docker logout "$GHCR_REGISTRY" || true
+          fi
+          if [[ "${REGISTRY_LOGGED_IN:-}" == "1" ]]; then
+            docker logout || true
+          fi
+
+      # ---------------------------------------------------------------
+      # Step 13: 清理 Docker 缓存（尽力而为，失败不影响结果）
+      #   注意：带 tag 的镜像不会被删除，仅清理构建缓存/悬空层
+      # ---------------------------------------------------------------
+      - name: 清理 Docker 缓存
+        if: ${{ always() }}
+        continue-on-error: true
+        run: docker system prune -f
