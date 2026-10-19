@@ -4,7 +4,7 @@
 # 完整链路：Git Clone 用户仓库 → 构建或拉取 Docker 镜像 → 打包产出 TGZ Artifact 或推送到 GHCR
 #
 # 三种获取模式（build_mode）：
-#   docker build : 从用户仓库的 Dockerfile 构建镜像（支持跨平台，QEMU 模拟）
+#   docker build : 从用户仓库的 Dockerfile 构建镜像（按目标平台原生架构构建）
 #   compose pull : 解析用户仓库的 Compose 文件，拉取其中定义的全部镜像（服务必须声明 image:）
 #   compose auto : 解析 Compose 文件，按服务自动处理 —— 声明 build: 则用 Compose 构建该服务镜像
 #                  （即使同时声明 image: 也按构建处理），仅声明 image:（无 build:）则拉取
@@ -24,6 +24,13 @@
 #   Dockerfile（docker build 模式取 dockerfile_path；compose auto 模式取构建型服务的
 #   Dockerfile）中 node 基础镜像 FROM 行后插入 ENV NODE_OPTIONS 调大堆上限，
 #   无需再手写 hook_command 补丁。默认 4GB 表示不注入任何内容
+#
+# Runner 选择（按目标平台自动匹配原生架构，避免 QEMU 跨架构模拟的性能损失）：
+#   linux/amd64 → ubuntu-latest（X86_64 原生）
+#   linux/arm64 → ubuntu-24.04-arm（ARM64 原生，公开仓库免费）
+#   两种情况 Docker build 均为原生执行；QEMU 仅在 Runner 架构与目标平台
+#   不一致时兜底安装（如私有仓库无 ARM Runner 权限被迫回退 x86 的场景，
+#   GitHub 托管 ARM Runner 对私有仓库需付费套餐，见 runs-on 处注释）
 #
 # 触发方式：workflow_dispatch（手动触发）
 #
@@ -136,7 +143,13 @@ env:
 jobs:
   build-and-package:
     name: Build / Pull and Package Images
-    runs-on: ubuntu-latest
+    # 按目标平台选择原生架构 Runner，避免 QEMU 跨架构模拟带来的大幅性能损失：
+    #   linux/amd64 → ubuntu-latest（X86_64 原生）
+    #   linux/arm64 → ubuntu-24.04-arm（ARM64 原生）
+    #   注：GitHub 托管 ARM Runner 对公开仓库免费；私有仓库需付费套餐，
+    #   若无权限调度 ARM Runner（报 no runner matching）可临时改回
+    #   ubuntu-latest，下方 QEMU 步骤会自动兜底为跨架构模拟
+    runs-on: ${{ inputs.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     timeout-minutes: 60
 
     steps:
@@ -250,11 +263,20 @@ jobs:
           echo "✅ 目标仓库克隆成功"
 
       # ---------------------------------------------------------------
-      # Step 4: 安装 QEMU + Buildx（跨平台构建 / 拉取的前提）
-      #   QEMU：在 x86 Runner 上模拟 arm64 执行 Dockerfile 中的 RUN 指令
-      #   Buildx：docker-container 驱动构建器，支持 --platform 跨平台构建
+      # Step 4: 校验 Runner 架构 + 按需安装 QEMU + 安装 Buildx
+      #   常规情况（amd64→X64、arm64→ARM64 原生 Runner）目标平台与
+      #   Runner 架构一致，Docker build 全程原生执行，跳过 QEMU 安装
+      #   QEMU：仅在 Runner 架构与目标平台不一致时兜底安装
+      #   （如在 x86 Runner 上模拟 arm64 执行 Dockerfile 中的 RUN 指令）
+      #   Buildx：docker-container 驱动构建器，支持 --platform 指定目标平台
       # ---------------------------------------------------------------
-      - name: 安装 QEMU（跨平台模拟）
+      - name: 校验 Runner 架构
+        run: |
+          echo "Runner 内核架构：$(uname -m)（GitHub runner.arch=${{ runner.arch }}）"
+          echo "目标平台：${{ inputs.platform }}"
+
+      - name: 安装 QEMU（仅 Runner 架构与目标平台不一致时兜底）
+        if: ${{ inputs.platform == 'linux/arm64' && runner.arch != 'ARM64' }}
         uses: docker/setup-qemu-action@v3
 
       - name: 安装 Docker Buildx
@@ -365,7 +387,7 @@ jobs:
             echo "请检查："
             echo "  1. 命令本身是否正确（可先在本地目标仓库根目录验证）"
             echo "  2. 对应脚本是否存在于目标仓库、是否具备可执行权限（必要时改用 bash xxx.sh 形式）"
-            echo "  3. 脚本依赖的工具（如 pnpm / corepack / python 等）是否在 ubuntu-latest Runner 上可用"
+            echo "  3. 脚本依赖的工具（如 pnpm / corepack / python 等）是否在 GitHub 托管 Runner 上可用"
             exit 1
           fi
           echo "✅ 钩子命令执行完成"
@@ -1235,6 +1257,7 @@ jobs:
           INPUT_IMAGE_NAME: ${{ inputs.image_name }}
           HOOK_COMMAND: ${{ inputs.hook_command }}
           NODE_HEAP: ${{ inputs.node_heap }}
+          RUNNER_ARCH: ${{ runner.arch }}
           RUN_NUMBER: ${{ github.run_number }}
           JOB_STATUS: ${{ job.status }}
         run: |
@@ -1280,6 +1303,7 @@ jobs:
             echo "| 模式 | \`${BUILD_MODE}\` |"
             echo "| 交付方式 | \`${DELIVERY_MODE}\` |"
             echo "| 目标平台 | \`${PLATFORM}\` |"
+            echo "| Runner 架构 | \`${RUNNER_ARCH}\`（X64 / ARM64，arm64 平台默认使用 ARM 原生 Runner） |"
             echo "| Node.js 堆上限 | \`${NODE_HEAP:-4GB}\` |"
             if [[ "$BUILD_MODE" == "docker build" ]]; then
               echo "| Dockerfile | \`${DOCKERFILE_PATH:-Dockerfile}\` |"
@@ -1405,7 +1429,7 @@ jobs:
               echo ""
               echo "- 参数校验失败 → 检查 repo_url 地址格式、image_name 是否为 name:tag 形式"
               echo "- 克隆失败 → 检查仓库地址；私有仓库需配置 \`CLONE_PAT\` secret"
-              echo "- 构建失败 → 检查 Dockerfile 及其依赖的网络资源；arm64 构建较慢属正常现象"
+              echo "- 构建失败 → 检查 Dockerfile 及其依赖的网络资源；arm64 已使用原生 ARM Runner 构建（若仓库无私有 ARM Runner 权限会回退 QEMU 模拟，速度较慢属正常）"
               echo "- 构建报 \`JavaScript heap out of memory\` → Node.js 默认堆上限不足，重新运行时把 \`node_heap\` 参数调大（本 workflow 会自动注入），或用 \`hook_command\` 手动打补丁（见 README FAQ）"
               echo "- 拉取失败 → 检查镜像名拼写、目标架构支持；私有镜像仓库需配置登录 secrets"
               if [[ "$DELIVERY_MODE" == "push" ]]; then
