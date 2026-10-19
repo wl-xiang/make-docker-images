@@ -1240,7 +1240,8 @@ jobs:
 
       # ---------------------------------------------------------------
       # Step 11: 输出运行摘要（显示在运行页面底部的 Summary 区域）
-      #   通用：配置参数、GitHub Ripple Hotlink（可点击仓库链接）
+      #   通用：配置参数、Runner 架构与环境（内核架构/CPU/内存/磁盘、
+      #   原生执行或 QEMU 模拟）、GitHub Ripple Hotlink（可点击仓库链接）
       #   delivery_mode=pack：产物文件名/大小/SHA256、镜像清单（架构+大小）、导入方法
       #   delivery_mode=push：GHCR 命名空间、镜像对照表、拉取命令、国内加速代理
       #   失败时给出排查指引
@@ -1277,6 +1278,26 @@ jobs:
           REPO_NAME_SUM="${REPO_NAME_SUM##*/}"
           REPO_NAME_LOWER="${REPO_NAME_SUM,,}"
 
+          # Runner 架构信息：内核架构、GitHub runner.arch 与执行模式判定
+          #   runner.arch 与目标平台架构一致 → 原生执行（ARM Runner 特性生效）
+          #   不一致（如 x86 Runner 构建 arm64）→ QEMU 模拟兜底，速度较慢
+          KERNEL_ARCH="$(uname -m)"
+          PLATFORM_ARCH="${PLATFORM##*/}"
+          case "$PLATFORM_ARCH" in
+            amd64) PLATFORM_ARCH_LABEL="X64" ;;
+            arm64) PLATFORM_ARCH_LABEL="ARM64" ;;
+            *)     PLATFORM_ARCH_LABEL="$PLATFORM_ARCH" ;;
+          esac
+          if [[ "$RUNNER_ARCH" == "$PLATFORM_ARCH_LABEL" ]]; then
+            EXEC_MODE="与目标平台一致，**原生执行**（无模拟开销）"
+          else
+            EXEC_MODE="与目标平台不一致，**QEMU 模拟兜底**（速度较慢）"
+          fi
+          # Runner 软硬件概览（GitHub 托管 Runner 预置 ImageOS / ImageVersion 环境变量）
+          CPU_COUNT="$(nproc)"
+          MEM_TOTAL="$(free -h | awk '/^Mem:/ {print $2}')"
+          DISK_AVAIL="$(df -h "$GITHUB_WORKSPACE" | awk 'NR==2 {print $4}')"
+
           # 取镜像大小（人类可读），镜像已不存在时返回 "-"
           img_size() {
             local bytes
@@ -1303,7 +1324,8 @@ jobs:
             echo "| 模式 | \`${BUILD_MODE}\` |"
             echo "| 交付方式 | \`${DELIVERY_MODE}\` |"
             echo "| 目标平台 | \`${PLATFORM}\` |"
-            echo "| Runner 架构 | \`${RUNNER_ARCH}\`（X64 / ARM64，arm64 平台默认使用 ARM 原生 Runner） |"
+            echo "| Runner 架构 | \`${RUNNER_ARCH}\`（内核 \`${KERNEL_ARCH}\`）—— ${EXEC_MODE} |"
+            echo "| Runner 环境 | \`${ImageOS:-unknown} ${ImageVersion:-}\` · CPU ${CPU_COUNT} 核 · 内存 ${MEM_TOTAL} · 磁盘可用 ${DISK_AVAIL} |"
             echo "| Node.js 堆上限 | \`${NODE_HEAP:-4GB}\` |"
             if [[ "$BUILD_MODE" == "docker build" ]]; then
               echo "| Dockerfile | \`${DOCKERFILE_PATH:-Dockerfile}\` |"
