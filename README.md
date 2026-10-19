@@ -51,7 +51,7 @@
 | 参数名 | 类型 | 必填 | 默认值 | 说明 |
 |---|---|---|---|---|
 | `repo_url` | string | ✅ | 无 | 目标仓库克隆链接，如 `https://github.com/wl-xiang/code-server-ai.git` |
-| `platform` | choice | ✅ | `linux/amd64` | 目标部署平台：`linux/amd64` 或 `linux/arm64` |
+| `platform` | choice | ✅ | `linux/amd64` | 目标部署平台：`linux/amd64` 或 `linux/arm64`。选 `linux/arm64` 时自动调度 GitHub **ARM 原生 Runner**（`ubuntu-24.04-arm`）原生构建，不走 QEMU 模拟 |
 | `build_mode` | choice | ✅ | `docker build` | 镜像获取模式，三选一：`docker build` / `compose pull` / `compose auto` |
 | `dockerfile_path` | string | ❌ | `Dockerfile` | Dockerfile 路径（相对目标仓库根目录），仅 `build_mode=docker build` 生效 |
 | `compose_file_path` | string | ❌ | `docker-compose.yml` | Compose 文件路径，仅 `build_mode=compose pull` / `compose auto` 生效 |
@@ -107,7 +107,7 @@ dockerfile_path  = docker/app/Dockerfile
 image_name       = myimg:1.0.0
 ```
 
-Runner 本身是 x86，workflow 会通过 **QEMU** 自动模拟 ARM 环境完成构建，无需额外配置。
+workflow 会自动选择 GitHub **ARM 原生 Runner**（`ubuntu-24.04-arm`）完成构建，全程原生架构执行，无需 QEMU 跨架构模拟，构建速度与 x86 相当（ARM Runner 对**公开仓库**免费；私有仓库需付费套餐，若调度报 `no runner matching`，可临时把 workflow 的 `runs-on` 改回 `ubuntu-latest`，此时自动回退 QEMU 模拟）。
 
 ### 示例三：compose pull 模式（打包 Compose 全部镜像）
 
@@ -286,7 +286,7 @@ A: 依次检查：① 仓库地址拼写是否正确；② 仓库是否真实存
 A: 路径是相对目标仓库**根目录**的。子目录中的文件需写完整相对路径，如 `docker/app/Dockerfile`。
 
 **Q: arm64 构建特别慢或失败？**
-A: arm64 构建依赖 QEMU 模拟，速度约为原生的 1/5~1/10，大型镜像可能超时。可拆分 Dockerfile 层、利用缓存，或增大 workflow 的 `timeout-minutes`。
+A: workflow 已为 arm64 自动选择 GitHub **ARM 原生 Runner**（`ubuntu-24.04-arm`），构建速度与 x86 相当，不再依赖 QEMU 模拟。若仓库为**私有**且无 ARM Runner 权限（调度时报 `no runner matching`），需付费套餐，或临时把 workflow 的 `runs-on` 改回 `ubuntu-latest` 回退 QEMU 模拟——此时速度约为原生的 1/5~1/10，大型镜像可能超时，可拆分 Dockerfile 层、利用缓存，或增大 workflow 的 `timeout-minutes`。
 
 **Q: 拉到的镜像架构不对？**
 A: 本 workflow 已用 `docker pull --platform` 强制拉取指定架构。若仍报架构错误，说明该镜像本身不支持目标架构（如仅提供 amd64 版本），需联系镜像作者。
