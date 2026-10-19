@@ -25,6 +25,16 @@
 #   Dockerfile）中 node 基础镜像 FROM 行后插入 ENV NODE_OPTIONS 调大堆上限，
 #   无需再手写 hook_command 补丁。默认 4GB 表示不注入任何内容
 #
+# 自定义 .env 内容（env_content / env_write_mode / env_content_path）：GitHub 输入框
+#   不支持换行，故多行内容用章节符号 § 分隔（如 PORT=4321§HOST=0.0.0.0§APP_NAME=jev），
+#   workflow 会把 § 转换为换行后写入 env_content_path 目录（留空表示目标仓库根目录）
+#   下的 .env 文件。env_write_mode 决定写入方式：
+#     create  : 仅在 .env 不存在时创建（已存在则跳过、不覆盖）
+#     replace : 覆盖已有 .env（不存在则创建）
+#     append  : 追加到已有 .env 末尾（不存在则创建）
+#   该逻辑在 .env.example 复制与 force_env 之前执行、优先级最高；
+#   env_content 留空表示不启用，原有 .env 处理逻辑完全不受影响
+#
 # Runner 选择（按目标平台自动匹配原生架构，避免 QEMU 跨架构模拟的性能损失）：
 #   linux/amd64 → ubuntu-latest（X86_64 原生）
 #   linux/arm64 → ubuntu-24.04-arm（ARM64 原生，公开仓库免费）
@@ -101,6 +111,25 @@ on:
         required: false
         default: ''
         type: string
+      env_content:
+        description: '.env 文件内容；多行请用章节符号 § 分隔（GitHub 输入框不支持换行），例如 PORT=4321§HOST=0.0.0.0§APP_NAME=jev。留空表示不启用。注意：不要写入敏感信息（公开仓库的输入对可见者公开）'
+        required: false
+        default: ''
+        type: string
+      env_write_mode:
+        description: '.env 写入模式：create=仅在不存在时创建（不覆盖）；replace=覆盖已有文件；append=追加到已有文件末尾（不存在则创建）。仅 env_content 非空时生效'
+        required: false
+        type: choice
+        default: create
+        options:
+          - create
+          - replace
+          - append
+      env_content_path:
+        description: '.env 写入目录（相对目标仓库根目录），留空表示项目根目录；仅 env_content 非空时生效'
+        required: false
+        default: ''
+        type: string
       image_name:
         description: '镜像名称与 tag（仅 build_mode=docker build 生效），例如 myimg:latest。留空则默认使用 <repo_name>:latest（platform=linux/arm64 时为 <repo_name>:latest-arm；repo_name 取自 repo_url 的项目名）'
         required: false
@@ -173,6 +202,9 @@ jobs:
           ENV_FILE_DIR: ${{ inputs.env_file_dir }}
           FORCE_ENV: ${{ inputs.force_env }}
           ENV_PATH: ${{ inputs.env_path }}
+          ENV_CONTENT: ${{ inputs.env_content }}
+          ENV_WRITE_MODE: ${{ inputs.env_write_mode }}
+          ENV_CONTENT_PATH: ${{ inputs.env_content_path }}
           IMAGE_NAME: ${{ inputs.image_name }}
         run: |
           set -euo pipefail
@@ -187,7 +219,7 @@ jobs:
           fi
 
           # -- 2. 路径参数校验（必须为相对路径，且不得包含 ..）--
-          for p in "$DOCKERFILE_PATH" "$COMPOSE_FILE_PATH" "$ENV_FILE_DIR" "$ENV_PATH"; do
+          for p in "$DOCKERFILE_PATH" "$COMPOSE_FILE_PATH" "$ENV_FILE_DIR" "$ENV_PATH" "$ENV_CONTENT_PATH"; do
             [[ -z "$p" ]] && continue
             [[ "$p" == /* ]] && fail "路径参数必须为相对路径（相对目标仓库根目录）：$p"
             [[ "$p" == *..* ]] && fail "路径参数不得包含 '..'：$p"
@@ -228,6 +260,14 @@ jobs:
           # -- 4. 交付方式校验 --
           if [[ "$DELIVERY_MODE" != "pack" && "$DELIVERY_MODE" != "push" ]]; then
             fail "delivery_mode 取值非法（当前值：$DELIVERY_MODE），只允许 pack 或 push"
+          fi
+
+          # -- 5. env_write_mode 校验（仅 env_content 非空时生效，默认 create）--
+          if [[ -n "${ENV_CONTENT:-}" ]]; then
+            case "${ENV_WRITE_MODE:-create}" in
+              create|replace|append) ;;
+              *) fail "env_write_mode 取值非法（当前值：$ENV_WRITE_MODE），只允许 create / replace / append" ;;
+            esac
           fi
 
           echo "✅ 输入参数校验通过（build_mode=$BUILD_MODE，delivery_mode=$DELIVERY_MODE，platform=$PLATFORM）"
@@ -306,11 +346,19 @@ jobs:
 
       # ---------------------------------------------------------------
       # Step 6: 准备环境变量文件（.env，可选）
-      #   1) 常规：部分项目的 Docker build / Compose pull 会读取 .env，而仓库
+      #   1) 自定义内容：env_content 非空时，把内容用章节符号 § 分隔的多行
+      #      转换为换行，写入 env_content_path 指定目录（留空表示目标仓库根
+      #      目录）下的 .env；写入方式由 env_write_mode 决定：
+      #        create  = 仅在 .env 不存在时创建（已存在则跳过、不覆盖）
+      #        replace = 覆盖已有 .env（不存在则创建）
+      #        append  = 追加到已有 .env 末尾（不存在则创建）
+      #      该步骤优先级最高，在下面两项之前执行（此后 .env 已存在，
+      #      复制与 force_env 会自然跳过）。
+      #   2) 常规：部分项目的 Docker build / Compose pull 会读取 .env，而仓库
       #      通常只提供 .env.example 模板。若指定目录下存在 .env.example 且不
       #      存在 .env，则自动复制一份，避免因缺少 .env 导致构建/拉取失败。
       #      env_file_dir 留空表示目标仓库根目录。
-      #   2) 强制：force_env=true 时，在 env_path 指定目录（留空表示目标仓库
+      #   3) 强制：force_env=true 时，在 env_path 指定目录（留空表示目标仓库
       #      根目录）强制生成一个空的 .env 文件（仅当该位置不存在 .env 时创建）。
       # ---------------------------------------------------------------
       - name: 准备环境变量文件（.env）
@@ -319,10 +367,53 @@ jobs:
           ENV_FILE_DIR: ${{ inputs.env_file_dir }}
           FORCE_ENV: ${{ inputs.force_env }}
           ENV_PATH: ${{ inputs.env_path }}
+          ENV_CONTENT: ${{ inputs.env_content }}
+          ENV_WRITE_MODE: ${{ inputs.env_write_mode }}
+          ENV_CONTENT_PATH: ${{ inputs.env_content_path }}
         run: |
           set -euo pipefail
 
-          # -- 1. 常规：从 .env.example 复制（留空时使用目标仓库根目录）--
+          # -- 1. 自定义内容：env_content（§ 分隔多行）写入 .env --
+          if [[ -n "${ENV_CONTENT:-}" ]]; then
+            CONTENT_DIR="${ENV_CONTENT_PATH:-.}"
+            if [[ ! -d "$CONTENT_DIR" ]]; then
+              echo "::error::env_content_path 目录不存在：$CONTENT_DIR（路径相对于目标仓库根目录）"
+              exit 1
+            fi
+            CONTENT_FILE="$CONTENT_DIR/.env"
+            # 章节符号 § 转换为换行（GitHub 输入框不支持换行，用 § 表示多行）
+            DECODED_CONTENT="$(printf '%s' "$ENV_CONTENT" | sed 's/§/\n/g')"
+            case "${ENV_WRITE_MODE:-create}" in
+              create)
+                if [[ -f "$CONTENT_FILE" ]]; then
+                  echo "ℹ️ $CONTENT_FILE 已存在，env_write_mode=create：跳过写入（不覆盖）"
+                else
+                  printf '%s\n' "$DECODED_CONTENT" > "$CONTENT_FILE"
+                  echo "✅ 已根据 env_content 创建 $CONTENT_FILE"
+                fi ;;
+              replace)
+                printf '%s\n' "$DECODED_CONTENT" > "$CONTENT_FILE"
+                echo "✅ 已根据 env_content 覆盖写入 $CONTENT_FILE（env_write_mode=replace）"
+                ;;
+              append)
+                if [[ -s "$CONTENT_FILE" ]]; then
+                  # 已有内容：确保末尾有换行再追加，避免与首行粘连
+                  if [[ "$(tail -c1 "$CONTENT_FILE" | wc -l)" -eq 0 ]]; then
+                    printf '\n' >> "$CONTENT_FILE"
+                  fi
+                  printf '%s\n' "$DECODED_CONTENT" >> "$CONTENT_FILE"
+                  echo "✅ 已根据 env_content 追加到 $CONTENT_FILE（env_write_mode=append）"
+                else
+                  printf '%s\n' "$DECODED_CONTENT" > "$CONTENT_FILE"
+                  echo "✅ 已根据 env_content 创建 $CONTENT_FILE（env_write_mode=append）"
+                fi ;;
+              *)
+                echo "::error::env_write_mode 取值非法：${ENV_WRITE_MODE}（允许 create / replace / append）"
+                exit 1 ;;
+            esac
+          fi
+
+          # -- 2. 常规：从 .env.example 复制（留空时使用目标仓库根目录）--
           TARGET_PATH="${ENV_FILE_DIR:-.}"
           if [[ ! -d "$TARGET_PATH" ]]; then
             echo "::error::环境变量文件目录不存在：$TARGET_PATH（路径相对于目标仓库根目录）"
