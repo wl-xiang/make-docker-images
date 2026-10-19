@@ -25,12 +25,6 @@
 #   Dockerfile）中 node 基础镜像 FROM 行后插入 ENV NODE_OPTIONS 调大堆上限，
 #   无需再手写 hook_command 补丁。默认 4GB 表示不注入任何内容
 #
-# .env 内容注入（env_content）：触发时直接填写 .env 内容，多行用章节符 § 分隔
-#   （Action 输入框不支持换行），如 PORT=4321§HOST=0.0.0.0§APP_NAME=jev；
-#   自动转换为换行后按 env_write_mode（create 仅创建 / replace 替换 /
-#   append 追加）写入 env_path 目录下的 .env；env_content 非空时跳过
-#   .env.example 模板复制与 force_env 空 .env 逻辑（互斥，行为可预测）
-#
 # Runner 选择（按目标平台自动匹配原生架构，避免 QEMU 跨架构模拟的性能损失）：
 #   linux/amd64 → ubuntu-latest（X86_64 原生）
 #   linux/arm64 → ubuntu-24.04-arm（ARM64 原生，公开仓库免费）
@@ -103,24 +97,10 @@ on:
         type: boolean
         default: false
       env_path:
-        description: '.env 文件生成目录（相对目标仓库根目录），留空表示项目根目录；env_content 内容写入与 force_env 空 .env 共用该目录'
+        description: '.env 文件生成目录（相对目标仓库根目录），留空表示项目根目录；仅 force_env=true 时生效'
         required: false
         default: ''
         type: string
-      env_content:
-        description: '.env 文件内容（可选）：多行用章节符 § 分隔（Action 输入框不支持换行），如 PORT=4321§HOST=0.0.0.0§APP_NAME=jev，自动转为换行后按 env_write_mode 写入 env_path 目录下的 .env；留空不启用'
-        required: false
-        default: ''
-        type: string
-      env_write_mode:
-        description: '.env 写入模式（仅 env_content 非空时生效）：create = 仅创建（已存在则跳过）；replace = 覆盖已有内容；append = 追加到已有文件末尾（不存在则创建）'
-        required: false
-        type: choice
-        default: create
-        options:
-          - create
-          - replace
-          - append
       image_name:
         description: '镜像名称与 tag（仅 build_mode=docker build 生效），例如 myimg:latest。留空则默认使用 <repo_name>:latest（platform=linux/arm64 时为 <repo_name>:latest-arm；repo_name 取自 repo_url 的项目名）'
         required: false
@@ -193,8 +173,6 @@ jobs:
           ENV_FILE_DIR: ${{ inputs.env_file_dir }}
           FORCE_ENV: ${{ inputs.force_env }}
           ENV_PATH: ${{ inputs.env_path }}
-          ENV_CONTENT: ${{ inputs.env_content }}
-          ENV_WRITE_MODE: ${{ inputs.env_write_mode }}
           IMAGE_NAME: ${{ inputs.image_name }}
         run: |
           set -euo pipefail
@@ -250,30 +228,6 @@ jobs:
           # -- 4. 交付方式校验 --
           if [[ "$DELIVERY_MODE" != "pack" && "$DELIVERY_MODE" != "push" ]]; then
             fail "delivery_mode 取值非法（当前值：$DELIVERY_MODE），只允许 pack 或 push"
-          fi
-
-          # -- 5. .env 内容与写入模式校验 --
-          if [[ "$ENV_WRITE_MODE" != "create" && "$ENV_WRITE_MODE" != "replace" && "$ENV_WRITE_MODE" != "append" ]]; then
-            fail "env_write_mode 取值非法（当前值：$ENV_WRITE_MODE），只允许 create / replace / append"
-          fi
-          if [[ -z "${ENV_CONTENT// /}" ]]; then
-            if [[ "$ENV_WRITE_MODE" != "create" ]]; then
-              echo "ℹ️ env_content 未填写，env_write_mode=$ENV_WRITE_MODE 不生效（仅 env_content 非空时生效）"
-            fi
-          else
-            # § 转换为换行后逐行校验（严格模式：非法行直接终止）
-            ENV_LINE_NO=0
-            while IFS= read -r env_line; do
-              env_line="${env_line#"${env_line%%[![:space:]]*}"}"
-              env_line="${env_line%"${env_line##*[![:space:]]}"}"
-              [[ -z "$env_line" ]] && continue
-              ENV_LINE_NO=$((ENV_LINE_NO + 1))
-              [[ "$env_line" == \#* ]] && continue
-              if [[ ! "$env_line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
-                fail ".env 内容第 ${ENV_LINE_NO} 行格式非法：\"$env_line\"。每行必须为 KEY=VALUE 形式（KEY 仅限字母/数字/下划线且不以数字开头）或 # 注释；多行内容请用章节符 § 分隔"
-              fi
-            done < <(printf '%s\n' "${ENV_CONTENT//§/$'\n'}")
-            echo "ℹ️ env_content 格式校验通过（共 ${ENV_LINE_NO} 行，含注释行）"
           fi
 
           echo "✅ 输入参数校验通过（build_mode=$BUILD_MODE，delivery_mode=$DELIVERY_MODE，platform=$PLATFORM）"
@@ -352,13 +306,6 @@ jobs:
 
       # ---------------------------------------------------------------
       # Step 6: 准备环境变量文件（.env，可选）
-      #   env_content 非空（互斥模式）：
-      #     将 § 分隔的 .env 内容转换为换行（§ 为行分隔符，因 Action 输入框
-      #     不支持换行），按 env_write_mode 写入 env_path 目录下的 .env：
-      #       create = 仅创建（已存在则跳过）；replace = 覆盖已有内容；
-      #       append = 追加到已有文件末尾（不存在则创建）
-      #     此模式下跳过下方 1) 2) 逻辑（用户显式内容优先，行为可预测）
-      #   env_content 为空（原有逻辑不变）：
       #   1) 常规：部分项目的 Docker build / Compose pull 会读取 .env，而仓库
       #      通常只提供 .env.example 模板。若指定目录下存在 .env.example 且不
       #      存在 .env，则自动复制一份，避免因缺少 .env 导致构建/拉取失败。
@@ -372,77 +319,8 @@ jobs:
           ENV_FILE_DIR: ${{ inputs.env_file_dir }}
           FORCE_ENV: ${{ inputs.force_env }}
           ENV_PATH: ${{ inputs.env_path }}
-          ENV_CONTENT: ${{ inputs.env_content }}
-          ENV_WRITE_MODE: ${{ inputs.env_write_mode }}
         run: |
           set -euo pipefail
-
-          # -- 0. env_content 非空：§ 转换为换行后按模式写入 env_path/.env --
-          if [[ -n "${ENV_CONTENT// /}" ]]; then
-            echo "ℹ️ 已填写 env_content，跳过 .env.example 模板复制与 force_env 空 .env 逻辑（互斥）"
-            CONTENT_DIR="${ENV_PATH:-.}"
-            if [[ ! -d "$CONTENT_DIR" ]]; then
-              echo "::error::env_path 目录不存在：$CONTENT_DIR（路径相对于目标仓库根目录）"
-              exit 1
-            fi
-            ENV_FILE="$CONTENT_DIR/.env"
-
-            # § → 换行，逐行去首尾空白、跳过空行，写入临时文件（格式已在 Step 2 校验通过）
-            TMP_FILE="$(mktemp)"
-            LINE_COUNT=0
-            KEY_LIST=""
-            while IFS= read -r env_line; do
-              env_line="${env_line#"${env_line%%[![:space:]]*}"}"
-              env_line="${env_line%"${env_line##*[![:space:]]}"}"
-              [[ -z "$env_line" ]] && continue
-              printf '%s\n' "$env_line" >> "$TMP_FILE"
-              LINE_COUNT=$((LINE_COUNT + 1))
-              [[ "$env_line" != \#* ]] && KEY_LIST+="${env_line%%=*} "
-            done < <(printf '%s\n' "${ENV_CONTENT//§/$'\n'}")
-            echo "📝 解析到 ${LINE_COUNT} 行内容，键：${KEY_LIST% }（值不打印，防敏感信息进入日志）"
-
-            case "$ENV_WRITE_MODE" in
-              create)
-                if [[ -f "$ENV_FILE" ]]; then
-                  rm -f "$TMP_FILE"
-                  echo "ℹ️ $ENV_FILE 已存在，env_write_mode=create 跳过写入（原文件保持不变）"
-                  WRITE_DESC="已存在，跳过（create）"
-                else
-                  mv "$TMP_FILE" "$ENV_FILE"
-                  echo "✅ 已创建 $ENV_FILE（${LINE_COUNT} 行）"
-                  WRITE_DESC="已创建，写入 ${LINE_COUNT} 行"
-                fi
-                ;;
-              replace)
-                mv "$TMP_FILE" "$ENV_FILE"
-                echo "✅ 已替换 $ENV_FILE（${LINE_COUNT} 行）"
-                WRITE_DESC="已替换，写入 ${LINE_COUNT} 行"
-                ;;
-              append)
-                if [[ -f "$ENV_FILE" ]]; then
-                  # 原文件末尾无换行时先补一个，避免与追加内容粘连
-                  [[ -n "$(tail -c 1 "$ENV_FILE")" ]] && printf '\n' >> "$ENV_FILE"
-                  cat "$TMP_FILE" >> "$ENV_FILE"
-                  rm -f "$TMP_FILE"
-                  echo "✅ 已追加到 $ENV_FILE（新增 ${LINE_COUNT} 行）"
-                  WRITE_DESC="已追加 ${LINE_COUNT} 行"
-                else
-                  mv "$TMP_FILE" "$ENV_FILE"
-                  echo "✅ 已创建 $ENV_FILE（${LINE_COUNT} 行）"
-                  WRITE_DESC="已创建，写入 ${LINE_COUNT} 行"
-                fi
-                ;;
-            esac
-
-            # 供 Step 11 摘要展示（不输出内容本身，仅元信息）
-            {
-              echo "ENV_WRITE_ENABLED=1"
-              echo "ENV_WRITE_MODE_OUT=$ENV_WRITE_MODE"
-              echo "ENV_WRITE_PATH=$ENV_FILE"
-              echo "ENV_WRITE_DESC=$WRITE_DESC"
-            } >> "$GITHUB_ENV"
-            exit 0
-          fi
 
           # -- 1. 常规：从 .env.example 复制（留空时使用目标仓库根目录）--
           TARGET_PATH="${ENV_FILE_DIR:-.}"
@@ -1449,11 +1327,6 @@ jobs:
             echo "| Runner 架构 | \`${RUNNER_ARCH}\`（内核 \`${KERNEL_ARCH}\`）—— ${EXEC_MODE} |"
             echo "| Runner 环境 | \`${ImageOS:-unknown} ${ImageVersion:-}\` · CPU ${CPU_COUNT} 核 · 内存 ${MEM_TOTAL} · 磁盘可用 ${DISK_AVAIL} |"
             echo "| Node.js 堆上限 | \`${NODE_HEAP:-4GB}\` |"
-            if [[ "${ENV_WRITE_ENABLED:-0}" == "1" ]]; then
-              echo "| .env 写入 | 模式 \`${ENV_WRITE_MODE_OUT}\` · \`${ENV_WRITE_PATH}\` · ${ENV_WRITE_DESC} |"
-            else
-              echo "| .env 写入 | （未启用，未填写 env_content） |"
-            fi
             if [[ "$BUILD_MODE" == "docker build" ]]; then
               echo "| Dockerfile | \`${DOCKERFILE_PATH:-Dockerfile}\` |"
               echo "| 镜像名称 | \`${IMAGE_NAME}\` |"
