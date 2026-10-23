@@ -936,11 +936,39 @@ jobs:
           #    声明了 image: 的构建型服务按该值命名，否则按 <project>-<service> 命名
           if [[ ${#BUILD_SVCS[@]} -gt 0 ]]; then
             echo "🔨 开始构建构建型服务镜像（平台：$PLATFORM）：${BUILD_SVCS[*]}"
-            if ! DOCKER_DEFAULT_PLATFORM="$PLATFORM" docker compose -f "$COMPOSE_FILE_PATH" build "${BUILD_SVCS[@]}"; then
+
+            # 平台参数强制透传：
+            #   Compose 文件常把 build.args.TARGETPLATFORM 写死（如 rustfs 的 docker-compose.yml
+            #   固定为 linux/amd64）。而 BuildKit 的自动平台参数会被 YAML 中的 build.args 覆盖，
+            #   导致在 arm64 Runner 上出现「用 arm64 容器去交叉编译 x86_64 目标」的情况：
+            #   交叉编译器找不到目标 sysroot 头文件，C 依赖（aws-lc-sys / openssl-sys 等）编译失败，
+            #   典型报错为 bits/libc-header-start.h / sys/types.h: No such file or directory。
+            #   CLI 的 --build-arg 优先级高于 Compose YAML 的 build.args，这里强制与本次请求的
+            #   platform 保持一致，保证「容器架构 = 编译目标架构 = Runner 架构」，走原生编译。
+            TARGET_OS="${PLATFORM%%/*}"       # linux
+            TARGET_ARCH="${PLATFORM##*/}"     # amd64 / arm64
+            COMPOSE_BUILD_ARGS=(
+              --build-arg "TARGETPLATFORM=${PLATFORM}"
+              --build-arg "TARGETOS=${TARGET_OS}"
+              --build-arg "TARGETARCH=${TARGET_ARCH}"
+            )
+            echo "ℹ️ 强制透传平台构建参数：TARGETPLATFORM=${PLATFORM} TARGETOS=${TARGET_OS} TARGETARCH=${TARGET_ARCH}"
+
+            BUILD_LOG="${RUNNER_TEMP:-/tmp}/compose-build.log"
+            if ! DOCKER_DEFAULT_PLATFORM="$PLATFORM" docker compose -f "$COMPOSE_FILE_PATH" build "${COMPOSE_BUILD_ARGS[@]}" "${BUILD_SVCS[@]}" 2>&1 | tee "$BUILD_LOG"; then
               echo "::error::构建型服务镜像构建失败，请检查对应服务的 build 配置及其依赖的网络资源是否可访问"
               echo "若日志中出现 'JavaScript heap out of memory'，是 Node.js 默认堆上限（约 4GB）不足："
               echo "  可将 node_heap 输入参数调大（如 12GB），本 workflow 会自动向构建型服务的 Dockerfile 注入 ENV NODE_OPTIONS；"
               echo "  Dockerfile 结构特殊时也可通过 hook_command 手动插入（示例见 README FAQ）"
+              # 交叉编译缺少目标平台 libc 头文件的典型报错（C 依赖：aws-lc-sys / openssl-sys / ring 等）
+              if grep -qE 'bits/libc-header-start\.h: No such file|sys/types\.h: No such file|ToolExecError' "$BUILD_LOG" 2>/dev/null; then
+                echo "::error::检测到「交叉编译缺少目标平台 libc 头文件」（bits/libc-header-start.h / sys/types.h 找不到）"
+                echo "  原因：编译目标架构与容器架构不一致，交叉编译器缺少目标 sysroot 头文件"
+                echo "  处理：① 确认 platform 参数与目标服务器架构一致（本 workflow 已强制透传 TARGETPLATFORM/TARGETARCH）；"
+                echo "        ② 若目标 Dockerfile 本身就要交叉编译，请在 hook_command 中补装对应的交叉 libc 头文件，例如："
+                echo "           sed -i 's/gcc-x86-64-linux-gnu/gcc-x86-64-linux-gnu libc6-dev-amd64-cross/' Dockerfile.source"
+                echo "           sed -i 's/gcc-aarch64-linux-gnu/gcc-aarch64-linux-gnu libc6-dev-arm64-cross/' Dockerfile.source"
+              fi
               exit 1
             fi
           fi
