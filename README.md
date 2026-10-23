@@ -77,6 +77,8 @@
 
 > 说明：服务同时声明 `build:` 与 `image:`（Compose 语义为「本地已构建的镜像优先复用，否则拉取」）时，云端无法保证该 `image` 已存在于 registry，因此 `compose auto` 统一按构建处理。
 
+> **平台一致性**：`compose auto` 构建时会强制透传 `TARGETPLATFORM` / `TARGETOS` / `TARGETARCH` 三个构建参数，值始终与本次输入的 `platform` 一致（CLI 的 `--build-arg` 优先级高于 Compose YAML 中的 `build.args`）。这可避免「Compose 把 `TARGETPLATFORM` 写死成另一个架构」导致在 arm64 Runner 上用 arm64 容器去交叉编译 x86_64 目标、进而因缺少交叉 libc 头文件而编译失败（详见 FAQ）。
+
 **参数校验规则**（校验不通过会立即终止）：
 
 1. `image_name` 必须包含冒号 `:` 且仅一个（格式 `name:tag`）
@@ -355,6 +357,25 @@ hook_command  = awk '/^FROM --platform=\$BUILDPLATFORM node:/ {print; print "ENV
 ```
 
 > 说明：该 awk 会把 `ENV NODE_OPTIONS="--max-old-space-size=12288"` 插到 Dockerfile 中每个 node 基础镜像 `FROM` 行之后（其他项目若 Dockerfile 结构不同，可自行调整匹配规则）。堆上限的选择与 Runner 内存限制见上文说明。
+
+**Q: 构建 RustFS 源码镜像失败，报 `bits/libc-header-start.h: No such file or directory` / `sys/types.h: No such file or directory`（`aws-lc-sys` 编译失败、`ToolExecError`）？**
+
+A: 这是**平台参数不一致导致的交叉编译**问题，与目标仓库的业务代码、Runner 内存都无关。
+
+- **成因**：目标仓库的 Compose 把 `build.args.TARGETPLATFORM` 写死成了另一个架构（RustFS 的 `docker-compose.yml` 固定为 `linux/amd64`）。BuildKit 的自动平台参数会被 YAML 中的 `build.args` 覆盖，于是 `platform=linux/arm64` 时变成「用 arm64 容器去编译 x86_64 目标」，交叉编译器 `x86_64-linux-gnu-gcc` 找不到目标 sysroot 头文件（Debian 需另装 `libc6-dev-amd64-cross`，而 `apt-get install --no-install-recommends` 会把它当作 Recommends 跳过），C 依赖 `aws-lc-sys`（jitterentropy）随即编译失败。
+- **已修复**：`compose auto` 构建时会用 `--build-arg` 强制透传 `TARGETPLATFORM` / `TARGETOS` / `TARGETARCH`，与 `platform` 输入保持一致，使「容器架构 = 编译目标架构 = Runner 架构」，走原生编译。重新触发即可。
+- **仍失败时**（目标 Dockerfile 本身就要交叉编译）：用 `hook_command` 补装对应的交叉 libc 头文件：
+
+```
+repo_url      = https://github.com/rustfs/rustfs.git
+platform      = linux/arm64
+build_mode    = compose auto
+hook_command  = sed -i 's/gcc-x86-64-linux-gnu/gcc-x86-64-linux-gnu libc6-dev-amd64-cross/; s/gcc-aarch64-linux-gnu/gcc-aarch64-linux-gnu libc6-dev-arm64-cross/' Dockerfile.source
+```
+
+> 交叉 libc 头文件包名对照：x86_64 → `libc6-dev-amd64-cross`，arm64 → `libc6-dev-arm64-cross`，armhf → `libc6-dev-armhf-cross`，i386 → `libc6-dev-i386-cross`。也可以直接删掉 Dockerfile 中的 `--no-install-recommends`（由 apt 的 Recommends 自动补齐），但会增加构建耗时与镜像体积。
+>
+> 若只是想要官方 RustFS 镜像而非本地编译：改用 `docker build` 模式 + `dockerfile_path=Dockerfile`（该 Dockerfile 直接下载官方预编译二进制，无需在 Runner 上编译 Rust）。
 
 **Q: 报错 `钩子命令执行失败`？**
 A: `hook_command` 会在目标仓库根目录执行。依次检查：① 命令拼写与参数是否正确（可先在本地目标仓库根目录验证）；② 脚本是否存在且可执行——不可执行时改用 `bash setup.sh` 形式；③ 脚本依赖的工具（如 `pnpm` / `corepack` / `python`）在 `ubuntu-latest` Runner 上是否可用（Runner 预装 node/python/docker/git 等，`pnpm` 可通过 `corepack enable` 启用，必要时把启用命令一并写入 `hook_command`）。
