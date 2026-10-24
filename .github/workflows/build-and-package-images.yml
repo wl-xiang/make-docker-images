@@ -42,6 +42,10 @@
 #   不一致时兜底安装（如私有仓库无 ARM Runner 权限被迫回退 x86 的场景，
 #   GitHub 托管 ARM Runner 对私有仓库需付费套餐，见 runs-on 处注释）
 #
+# 指定分支/标签（ref）：留空表示不指定，克隆仓库默认分支（HEAD）的最新内容；
+#   填写后只拉取该分支或 Tag 的内容（git clone --single-branch --branch <ref>），
+#   不会拉取其他分支，可显著减少克隆耗时与磁盘占用
+#
 # 触发方式：workflow_dispatch（手动触发）
 #
 # 可选 Secrets：
@@ -60,6 +64,11 @@ on:
       repo_url:
         description: 'GitHub 仓库克隆链接，例如 https://github.com/wl-xiang/code-server-ai.git'
         required: true
+        type: string
+      ref:
+        description: '指定拉取的分支或 Tag（留空表示不指定，拉取仓库默认分支的 latest）。填写后只拉取该分支/Tag 的内容，例如 dev、release/v1.0、v1.2.3'
+        required: false
+        default: ''
         type: string
       platform:
         description: '目标部署服务器平台'
@@ -194,6 +203,7 @@ jobs:
       - name: 校验输入参数
         env:
           REPO_URL: ${{ inputs.repo_url }}
+          REF: ${{ inputs.ref }}
           PLATFORM: ${{ inputs.platform }}
           BUILD_MODE: ${{ inputs.build_mode }}
           DELIVERY_MODE: ${{ inputs.delivery_mode }}
@@ -218,14 +228,34 @@ jobs:
             fail "repo_url 不合法（当前值：$REPO_URL）。必须是形如 https://github.com/<owner>/<repo> 的 GitHub 仓库地址"
           fi
 
-          # -- 2. 路径参数校验（必须为相对路径，且不得包含 ..）--
+          # -- 2. 分支/标签（ref）校验（留空表示不指定，拉取默认分支）--
+          if [[ -n "${REF:-}" ]]; then
+            if [[ "$REF" == -* ]]; then
+              fail "ref 不能以 '-' 开头（当前值：$REF）"
+            fi
+            if [[ "$REF" =~ [[:space:]] ]]; then
+              fail "ref 不能包含空白字符（当前值：$REF）"
+            fi
+            if [[ "$REF" == *".."* || "$REF" == *"/."* || "$REF" == *"//"* ]]; then
+              fail "ref 含非法路径片段（..、/. 或 //），当前值：$REF"
+            fi
+            # git 保留字符 ~ ^ : ? * [ \ 及 @{ 等不允许出现在 ref 名中
+            if printf '%s' "$REF" | grep -qE '[~^:?*\[\\@\{]'; then
+              fail "ref 含 git 保留字符 ~ ^ : ? * [ \\ @ {（当前值：$REF）"
+            fi
+            if [[ "$REF" == *".lock" ]]; then
+              fail "ref 不能以 .lock 结尾（当前值：$REF）"
+            fi
+          fi
+
+          # -- 3. 路径参数校验（必须为相对路径，且不得包含 ..）--
           for p in "$DOCKERFILE_PATH" "$COMPOSE_FILE_PATH" "$ENV_FILE_DIR" "$ENV_PATH" "$ENV_CONTENT_PATH"; do
             [[ -z "$p" ]] && continue
             [[ "$p" == /* ]] && fail "路径参数必须为相对路径（相对目标仓库根目录）：$p"
             [[ "$p" == *..* ]] && fail "路径参数不得包含 '..'：$p"
           done
 
-          # -- 3. 模式联动校验 --
+          # -- 4. 模式联动校验 --
           if [[ "$BUILD_MODE" == "docker build" ]]; then
             if [[ -z "${IMAGE_NAME// /}" ]]; then
               # 留空时构建阶段将默认使用 <repo_name>:<默认tag>（arm64 为 latest-arm），此处跳过格式校验
@@ -257,12 +287,12 @@ jobs:
             echo "build_mode=$BUILD_MODE：image_name 将被忽略（镜像列表由 Compose 文件决定）"
           fi
 
-          # -- 4. 交付方式校验 --
+          # -- 5. 交付方式校验 --
           if [[ "$DELIVERY_MODE" != "pack" && "$DELIVERY_MODE" != "push" ]]; then
             fail "delivery_mode 取值非法（当前值：$DELIVERY_MODE），只允许 pack 或 push"
           fi
 
-          # -- 5. env_write_mode 校验（仅 env_content 非空时生效，默认 create）--
+          # -- 6. env_write_mode 校验（仅 env_content 非空时生效，默认 create）--
           if [[ -n "${ENV_CONTENT:-}" ]]; then
             case "${ENV_WRITE_MODE:-create}" in
               create|replace|append) ;;
@@ -270,17 +300,25 @@ jobs:
             esac
           fi
 
-          echo "✅ 输入参数校验通过（build_mode=$BUILD_MODE，delivery_mode=$DELIVERY_MODE，platform=$PLATFORM）"
+          if [[ -n "${REF:-}" ]]; then
+            echo "✅ 输入参数校验通过（build_mode=$BUILD_MODE，delivery_mode=$DELIVERY_MODE，platform=$PLATFORM，ref=$REF）"
+          else
+            echo "✅ 输入参数校验通过（build_mode=$BUILD_MODE，delivery_mode=$DELIVERY_MODE，platform=$PLATFORM，ref 未指定→克隆默认分支）"
+          fi
 
       # ---------------------------------------------------------------
       # Step 3: 浅克隆用户目标仓库
       #   私有仓库支持：在本仓库 Settings → Secrets → Actions 中配置
       #   CLONE_PAT（具有 repo 读权限的 PAT）即可，无需修改 workflow
       #   GIT_TERMINAL_PROMPT=0：凭据缺失时快速失败，避免挂起等待输入
+      #   ref（分支/标签）：留空 → 克隆仓库默认分支（HEAD）的最新提交；
+      #     填写 → 只拉取该分支或 Tag（--single-branch --branch <ref>），
+      #     Tag 会以 detached HEAD 检出该 Tag 对应的提交
       # ---------------------------------------------------------------
       - name: 克隆目标仓库
         env:
           REPO_URL: ${{ inputs.repo_url }}
+          REF: ${{ inputs.ref }}
           CLONE_PAT: ${{ secrets.CLONE_PAT }}
           GIT_TERMINAL_PROMPT: '0'
         run: |
@@ -293,14 +331,27 @@ jobs:
             echo "已配置 CLONE_PAT，将以令牌方式克隆私有仓库"
           fi
 
-          if ! git clone --depth 1 "$CLONE_URL" "$TARGET_DIR"; then
-            echo "::error::克隆失败：$REPO_URL"
+          # 克隆参数：指定 ref 时追加 --single-branch --branch <ref>，只拉取该分支/Tag
+          CLONE_ARGS=(--depth 1)
+          if [[ -n "${REF:-}" ]]; then
+            CLONE_ARGS+=(--single-branch --branch "$REF")
+            echo "🎯 指定分支/标签：$REF（仅拉取该分支/Tag 的内容）"
+          else
+            echo "ℹ️ 未指定分支/标签，将拉取仓库默认分支（HEAD）的最新内容"
+          fi
+
+          if ! git clone "${CLONE_ARGS[@]}" "$CLONE_URL" "$TARGET_DIR"; then
+            echo "::error::克隆失败：$REPO_URL${REF:+（分支/标签：$REF）}"
             echo "请依次检查："
             echo "  1. 仓库地址是否正确、仓库是否存在"
-            echo "  2. 若为私有仓库，请在本仓库 Settings → Secrets and variables → Actions 中配置 CLONE_PAT（需 repo 读权限的 PAT）"
+            if [[ -n "${REF:-}" ]]; then
+              echo "  2. 分支/标签 '$REF' 是否存在（注意区分分支名与 Tag 名，大小写敏感）"
+            fi
+            echo "  3. 若为私有仓库，请在本仓库 Settings → Secrets and variables → Actions 中配置 CLONE_PAT（需 repo 读权限的 PAT）"
             exit 1
           fi
           echo "✅ 目标仓库克隆成功"
+          echo "当前检出：$(git -C "$TARGET_DIR" log -1 --pretty=format:'%h %d %s')"
 
       # ---------------------------------------------------------------
       # Step 4: 校验 Runner 架构 + 按需安装 QEMU + 安装 Buildx
@@ -1369,6 +1420,7 @@ jobs:
         if: ${{ always() }}
         env:
           REPO_URL: ${{ inputs.repo_url }}
+          REF: ${{ inputs.ref }}
           PLATFORM: ${{ inputs.platform }}
           BUILD_MODE: ${{ inputs.build_mode }}
           DELIVERY_MODE: ${{ inputs.delivery_mode }}
@@ -1440,6 +1492,11 @@ jobs:
             echo "| 运行编号 | #${RUN_NUMBER} |"
             echo "| 目标仓库 | \`${REPO_URL}\` |"
             echo "| GitHub Ripple Hotlink | <a href=\"${REPO_LINK}\" target=\"_blank\" rel=\"noopener noreferrer\">${REPO_LINK}</a> |"
+            if [[ -n "${REF:-}" ]]; then
+              echo "| 分支/标签 | \`${REF}\`（仅拉取该分支/Tag 的内容） |"
+            else
+              echo "| 分支/标签 | （未指定，拉取默认分支） |"
+            fi
             echo "| 模式 | \`${BUILD_MODE}\` |"
             echo "| 交付方式 | \`${DELIVERY_MODE}\` |"
             echo "| 目标平台 | \`${PLATFORM}\` |"
@@ -1570,6 +1627,9 @@ jobs:
               echo ""
               echo "- 参数校验失败 → 检查 repo_url 地址格式、image_name 是否为 name:tag 形式"
               echo "- 克隆失败 → 检查仓库地址；私有仓库需配置 \`CLONE_PAT\` secret"
+              if [[ -n "${REF:-}" ]]; then
+                echo "- 克隆失败且指定了分支/标签 → 确认 \`${REF}\` 在目标仓库中存在（区分分支名与 Tag 名）"
+              fi
               echo "- 构建失败 → 检查 Dockerfile 及其依赖的网络资源；arm64 已使用原生 ARM Runner 构建（若仓库无私有 ARM Runner 权限会回退 QEMU 模拟，速度较慢属正常）"
               echo "- 构建报 \`JavaScript heap out of memory\` → Node.js 默认堆上限不足，重新运行时把 \`node_heap\` 参数调大（本 workflow 会自动注入），或用 \`hook_command\` 手动打补丁（见 README FAQ）"
               echo "- 拉取失败 → 检查镜像名拼写、目标架构支持；私有镜像仓库需配置登录 secrets"
