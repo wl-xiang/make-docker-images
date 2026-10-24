@@ -9,11 +9,11 @@
           │
           ▼
 ┌─────────────────────┐
-│  校验输入参数       │  repo_url 格式 / image_name 必须为 name:tag
+│  校验输入参数       │  repo_url 格式 / image_name 必须为 name:tag / ref 合法性
 └─────────┬───────────┘
           ▼
 ┌─────────────────────┐
-│  浅克隆目标仓库     │  git clone --depth 1（私有仓库支持 CLONE_PAT）
+│  浅克隆目标仓库     │  git clone --depth 1（ref 非空时加 --single-branch --branch <ref>）
 └─────────┬───────────┘
           ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -51,6 +51,7 @@
 | 参数名 | 类型 | 必填 | 默认值 | 说明 |
 |---|---|---|---|---|
 | `repo_url` | string | ✅ | 无 | 目标仓库克隆链接，如 `https://github.com/wl-xiang/code-server-ai.git` |
+| `ref` | string | ❌ | 空 | 指定拉取的分支或 Tag，如 `dev`、`release/v1.0`、`v1.2.3`。留空表示不指定，拉取仓库默认分支的最新内容；指定后只拉取该分支/Tag 的内容（`--single-branch`），不拉取其他分支，可显著减少克隆耗时与磁盘占用 |
 | `platform` | choice | ✅ | `linux/amd64` | 目标部署平台：`linux/amd64` 或 `linux/arm64`。选 `linux/arm64` 时自动调度 GitHub **ARM 原生 Runner**（`ubuntu-24.04-arm`）原生构建，不走 QEMU 模拟 |
 | `build_mode` | choice | ✅ | `docker build` | 镜像获取模式，三选一：`docker build` / `compose pull` / `compose auto` |
 | `dockerfile_path` | string | ❌ | `Dockerfile` | Dockerfile 路径（相对目标仓库根目录），仅 `build_mode=docker build` 生效 |
@@ -84,8 +85,9 @@
 1. `image_name` 必须包含冒号 `:` 且仅一个（格式 `name:tag`）
 2. `build_mode=docker build` 时 `image_name` 可选（留空默认 `<repo_name>:latest`），填写时须符合 `name:tag`；`compose pull` / `compose auto` 时忽略
 3. `repo_url` 必须是合法的 `https://github.com/<owner>/<repo>` 地址
-4. 所有路径参数（`dockerfile_path` / `compose_file_path` / `env_file_dir` / `env_path` / `env_content_path`）必须为相对路径且不得包含 `..`
-5. `env_content` 非空时，`env_write_mode` 必须为 `create` / `replace` / `append` 之一
+4. `ref` 非空时不得包含空白字符、`..`、`/.`、`//`，不得以 `-` 开头或以 `.lock` 结尾，且不得含 git 保留字符 `~ ^ : ? * [ \ @ {`
+5. 所有路径参数（`dockerfile_path` / `compose_file_path` / `env_file_dir` / `env_path` / `env_content_path`）必须为相对路径且不得包含 `..`
+6. `env_content` 非空时，`env_write_mode` 必须为 `create` / `replace` / `append` 之一
 
 > GitHub Actions 的 `workflow_dispatch` 不支持按条件隐藏输入框，因此 `force_env` / `env_path` / `env_content` / `env_write_mode` / `env_content_path` 会始终显示；`env_path` 仅在 `force_env=true` 时生效，`env_write_mode` / `env_content_path` 仅在 `env_content` 非空时生效。
 
@@ -231,6 +233,25 @@ workflow 会：
 - `env_content` 留空时该功能完全不生效，原有 `.env` 处理逻辑不受影响
 - ⚠️ `env_content` 的值会保存在 workflow 运行记录中（公开仓库对可见者公开），**请勿写入密码 / 密钥**，敏感值请改用仓库 Secrets
 
+### 示例八：指定分支或 Tag（ref）
+
+需要构建目标仓库的某个分支或某个 Tag（而非默认分支）时，填写 `ref`：
+
+```
+repo_url  = https://github.com/user/some-repo.git
+ref       = dev              # 或 release/v1.0、v1.2.3
+platform  = linux/amd64
+build_mode = compose auto
+```
+
+说明：
+
+- `ref` **留空**表示不指定：克隆仓库默认分支（HEAD）的最新内容，行为与此前完全一致
+- `ref` **填写**后，克隆命令变为 `git clone --depth 1 --single-branch --branch <ref>`，**只拉取该分支或 Tag 的内容**，不会拉取其他分支，可显著减少克隆耗时与磁盘占用
+- Tag 会被检出为 **detached HEAD**（对应 Tag 的提交），不影响后续 Docker 构建/拉取
+- 分支名与 Tag 名区分大小写；若该 ref 不存在，克隆会失败并在 Summary 中给出提示
+- `ref` 不影响镜像命名与打包产物命名（产物名仍取自 `repo_url` 的项目名）
+
 ## 产出物
 
 每次运行产出**一个 TGZ 文件**，命名规范：
@@ -318,7 +339,10 @@ docker compose -f docker-compose-ghcr.yml up -d
 A: `build_mode=docker build` 时若填写了 `image_name`，必须写成 `名称:tag` 的完整形式（如 `myimg:latest`），不能只写名称；留空则默认 `<repo_name>:latest`。
 
 **Q: 报错 `克隆失败`？**
-A: 依次检查：① 仓库地址拼写是否正确；② 仓库是否真实存在；③ 私有仓库是否已配置 `CLONE_PAT` secret。
+A: 依次检查：① 仓库地址拼写是否正确；② 仓库是否真实存在；③ 私有仓库是否已配置 `CLONE_PAT` secret；④ 若填写了 `ref`，确认该分支/Tag 在仓库中存在（分支名与 Tag 名区分大小写）。
+
+**Q: `ref` 留空和填写的区别？**
+A: 留空 → 克隆仓库默认分支（HEAD）的最新内容，行为与此前一致；填写（如 `dev`、`v1.2.3`）→ 克隆命令追加 `--single-branch --branch <ref>`，**只拉取该分支或 Tag 的内容**，不拉取其他分支。Tag 会以 detached HEAD 检出，不影响后续 Docker 构建/拉取。
 
 **Q: 报错 `未找到 Dockerfile` / `未找到 Compose 文件`？**
 A: 路径是相对目标仓库**根目录**的。子目录中的文件需写完整相对路径，如 `docker/app/Dockerfile`。
