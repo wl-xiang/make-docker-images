@@ -28,7 +28,7 @@
 └─────────┬───────────┘
           │
           ▼
-  <repo-name>_docker-images_<platform>_<yyyymmdd-HHMMSS>.tgz（可下载，离线部署用）
+  <repo-name>_docker-images_<platform>/ 目录（内含 load.sh 与 TGZ，可下载，离线部署用）
 ```
 
 ## 使用方法
@@ -43,7 +43,7 @@
 1. 进入本仓库的 GitHub 页面 → **Actions** 标签页
 2. 左侧选择 **Build and Package Docker Images** workflow
 3. 点击 **Run workflow**，填写参数后点击绿色 **Run workflow** 按钮
-4. 运行完成后，在该次运行页面底部的 **Artifacts** 区域下载产物（下载得到 zip，解压即为 TGZ 文件）
+4. 运行完成后，在该次运行页面底部的 **Artifacts** 区域下载产物（下载得到 zip，解压后得到目录 `<repo-name>_docker-images_<platform>/`，内含 `load.sh` 与 TGZ 文件）
 5. 运行页面的 **Summary** 区域会显示本次运行的摘要：输入参数、产出文件名/大小/SHA256、镜像清单（架构 + 大小）、目标服务器导入命令
 
 ### 输入参数说明
@@ -254,16 +254,21 @@ build_mode = compose auto
 
 ## 产出物
 
-每次运行产出**一个 TGZ 文件**，命名规范：
+每次运行产出一个 Artifact，命名规范：
 
 ```
-<repo-name>_docker-images_<platform>_<yyyymmdd-HHMMSS>.tgz
-例如：code-server-ai_docker-images_linux-amd64_20261009-153045.tgz
+<repo-name>_docker-images_<platform>/
+├── load.sh
+└── <repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>.tgz
+例如：code-server-ai_docker-images_linux-amd64/
+        ├── load.sh
+        └── code-server-ai_docker-images_linux-amd64_20261009-1530.tgz
 ```
 
 - `<repo-name>`：取自 `repo_url` 的项目名（如 `https://github.com/wl-xiang/code-server-ai.git` → `code-server-ai`）
 - `<platform>`：目标平台，`/` 替换为 `-`（如 `linux/amd64` → `linux-amd64`）
-- `<yyyymmdd-HHMMSS>`：打包时的北京时间戳
+- `<yyyymmdd-HHMM>`：打包时的北京时间戳
+- Artifact 名称为 `<repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>`（带时间戳，避免同一 run 重跑时冲突）；zip 解压后得到的目录为 `<repo-name>_docker-images_<platform>`（不含时间戳）
 - `docker build` 模式：包含 1 个镜像
 - `compose pull` 模式：包含 Compose 文件中声明的全部 `image:` 镜像
 - `compose auto` 模式：包含 Compose 中拉取的镜像 + 构建型服务的镜像（声明了 `image:` 者按该值，否则为 `<project>-<service>`）
@@ -273,18 +278,21 @@ build_mode = compose auto
 
 ### 下载后在目标服务器导入
 
-从 run 页面 **Artifacts** 区域下载（例如 `code-server-ai_docker-images_linux-amd64_20261009-153045`，下载得到的是 zip，**解压后即为 TGZ 文件**）：
+从 run 页面 **Artifacts** 区域下载（例如 `code-server-ai_docker-images_linux-amd64_20261009-1530`，下载得到的是 zip，**解压后得到目录 `code-server-ai_docker-images_linux-amd64/`**，内含 `load.sh` 与 TGZ）：
 
 ```bash
+# 方式一：一键导入（推荐）
+cd code-server-ai_docker-images_linux-amd64
+./load.sh
+# 注：GitHub Artifact 解压后可能重置文件权限，若提示 Permission denied，
+#     执行 chmod +x load.sh && ./load.sh，或直接用 bash load.sh
+
+# 方式二：手动导入
 # 0. 校验完整性（可选，SHA256 值见 run 页面的 Summary）
-echo "<summary 中的 sha256>  code-server-ai_docker-images_linux-amd64_20261009-153045.tgz" | sha256sum -c
+echo "<summary 中的 sha256>  code-server-ai_docker-images_linux-amd64_20261009-1530.tgz" | sha256sum -c
 
-# 方式一：gunzip 后导入
-gunzip code-server-ai_docker-images_linux-amd64_20261009-153045.tgz
-docker load -i code-server-ai_docker-images_linux-amd64_20261009-153045.tar
-
-# 方式二：一步到位（推荐）
-docker load -i <(gunzip -c code-server-ai_docker-images_linux-amd64_20261009-153045.tgz)
+# 一步到位
+docker load -i <(gunzip -c code-server-ai_docker-images_linux-amd64_20261009-1530.tgz)
 
 # 验证镜像已导入
 docker images
@@ -417,7 +425,7 @@ A: 取决于 `env_write_mode`：`create`（默认）只在 `.env` 不存在时�
 A: 不建议。`env_content` 的值会保存在 workflow 运行记录中（公开仓库对可见者公开），敏感值请改用仓库 Secrets，仅将非敏感的配置项写入 `env_content`。
 
 **Q: 下载的 Artifact 是 `.zip` 而不是 `.tgz`？**
-A: 正常现象。GitHub Actions 下载 Artifact 时会自动套一层 zip，解压 zip 即得到 TGZ 文件。
+A: 正常现象。GitHub Actions 下载 Artifact 时会自动套一层 zip；解压后得到目录 `<repo-name>_docker-images_<platform>/`，其中包含 `load.sh` 与 TGZ 文件，进入目录执行 `./load.sh` 即可一键导入。
 
 **Q: 报错 `镜像的架构为 ... 与目标平台不符`？**
 A: 打包前会校验每个镜像的架构。若出现该报错，说明镜像本身不支持目标架构（如仅提供 amd64 版本却选择了 arm64），需联系镜像作者或更换镜像。
