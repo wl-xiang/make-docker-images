@@ -10,7 +10,8 @@
 #                  （即使同时声明 image: 也按构建处理），仅声明 image:（无 build:）则拉取
 #
 # 两种交付方式（delivery_mode）：
-#   pack : 将全部镜像 docker save 并压缩为 TGZ，上传到 Artifacts（默认）
+#   pack : 将全部镜像 docker save 并压缩为 TGZ，连同 load.sh 一起打包为目录上传到
+#          Artifacts（默认），解压后可直接执行 ./load.sh 一键导入
 #   push : 将全部镜像重新打标签为 ghcr.io/<owner>/<repo>/<镜像名>:<tag> 并推送到 GHCR；
 #          并生成 docker-compose-ghcr.yml（所有 image: 已替换为 GHCR 地址、build: 段已移除）
 #          上传为 Artifact（docker-compose-ghcr），摘要中给出拉取命令与国内加速代理
@@ -1326,8 +1327,10 @@ jobs:
 
       # ---------------------------------------------------------------
       # Step 9: docker save 导出全部镜像，并压缩为 TGZ
-      #   文件名：<repo-name>_docker-images_<platform>_<yyyymmdd-HHMMSS>.tgz
-      #   Artifact 命名：与文件名同基名（不含 .tgz 扩展名）
+      #   产物目录：dist/<repo-name>_docker-images_<platform>/
+      #     ├── load.sh                                                （可执行，一键导入）
+      #     └── <repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>.tgz
+      #   Artifact 命名：<产物目录名>_<yyyymmdd-HHMM>（带时间戳，避免同一 run 重跑时冲突）
       #   repo-name 取自 repo_url 的项目名；时间戳使用 Asia/Shanghai 时区
       # ---------------------------------------------------------------
       - name: 导出镜像并压缩为 TGZ（delivery_mode=pack）
@@ -1349,18 +1352,22 @@ jobs:
 
           # linux/amd64 -> linux-amd64（文件名中不能包含 /）
           PLATFORM_TAG="${PLATFORM//\//-}"
-          # 北京时间戳，形如 20261009-153045
-          TIMESTAMP="$(TZ='Asia/Shanghai' date +%Y%m%d-%H%M%S)"
+          # 北京时间戳，形如 20261009-1530
+          TIMESTAMP="$(TZ='Asia/Shanghai' date +%Y%m%d-%H%M)"
 
-          ARTIFACT_NAME="${REPO_NAME}_docker-images_${PLATFORM_TAG}_${TIMESTAMP}"
-          TGZ_NAME="${ARTIFACT_NAME}.tgz"
+          # 解压后的目录名：<repo-name>_docker-images_<platform>
+          BUNDLE_NAME="${REPO_NAME}_docker-images_${PLATFORM_TAG}"
+          # Artifact 名带时间戳，避免同一 run 重跑（re-run）时与已有 Artifact 冲突
+          ARTIFACT_NAME="${BUNDLE_NAME}_${TIMESTAMP}"
+          TGZ_NAME="${BUNDLE_NAME}_${TIMESTAMP}.tgz"
+          BUNDLE_DIR="dist/$BUNDLE_NAME"
 
           if [[ ! -s "$IMAGE_LIST_FILE" ]]; then
             echo "::error::未找到镜像列表文件 $IMAGE_LIST_FILE，前置步骤可能未执行"
             exit 1
           fi
 
-          mkdir -p dist
+          mkdir -p "$BUNDLE_DIR"
           mapfile -t IMAGES < <(grep -v '^[[:space:]]*$' "$IMAGE_LIST_FILE" || true)
 
           if [[ ${#IMAGES[@]} -eq 0 ]]; then
@@ -1371,40 +1378,62 @@ jobs:
           echo "📤 导出以下 ${#IMAGES[@]} 个镜像："
           printf '  - %s\n' "${IMAGES[@]}"
 
-          if ! docker save "${IMAGES[@]}" | gzip > "dist/$TGZ_NAME"; then
+          if ! docker save "${IMAGES[@]}" | gzip > "$BUNDLE_DIR/$TGZ_NAME"; then
             echo "::error::docker save / 压缩失败"
             exit 1
           fi
 
-          if [[ ! -s "dist/$TGZ_NAME" ]]; then
-            echo "::error::TGZ 产物为空文件：dist/$TGZ_NAME"
+          if [[ ! -s "$BUNDLE_DIR/$TGZ_NAME" ]]; then
+            echo "::error::TGZ 产物为空文件：$BUNDLE_DIR/$TGZ_NAME"
             exit 1
           fi
 
-          TGZ_SHA256=$(sha256sum "dist/$TGZ_NAME" | awk '{print $1}')
-          TGZ_SIZE=$(du -h "dist/$TGZ_NAME" | cut -f1)
+          TGZ_SHA256=$(sha256sum "$BUNDLE_DIR/$TGZ_NAME" | awk '{print $1}')
+          TGZ_SIZE=$(du -h "$BUNDLE_DIR/$TGZ_NAME" | cut -f1)
+
+          # 生成一键导入脚本：解压后直接 ./load.sh 即可
+          cat > "$BUNDLE_DIR/load.sh" <<EOF
+          #!/usr/bin/env bash
+          # 一键导入镜像：在当前目录执行 ./load.sh
+          set -euo pipefail
+
+          SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+          TGZ_FILE="\${SCRIPT_DIR}/${TGZ_NAME}"
+
+          if [[ ! -f "\${TGZ_FILE}" ]]; then
+            echo "错误：未找到镜像包 \${TGZ_FILE}" >&2
+            exit 1
+          fi
+
+          echo "正在导入镜像：${TGZ_NAME}"
+          gunzip -c "\${TGZ_FILE}" | docker load
+          echo "✅ 镜像导入完成"
+          EOF
+          chmod +x "$BUNDLE_DIR/load.sh"
 
           {
             echo "ARTIFACT_NAME=$ARTIFACT_NAME"
+            echo "BUNDLE_NAME=$BUNDLE_NAME"
             echo "TGZ_NAME=$TGZ_NAME"
+            echo "TGZ_PATH=$BUNDLE_DIR/$TGZ_NAME"
             echo "TGZ_SHA256=$TGZ_SHA256"
             echo "TGZ_SIZE=$TGZ_SIZE"
           } >> "$GITHUB_ENV"
 
-          echo "✅ 打包完成：dist/$TGZ_NAME（${TGZ_SIZE}，SHA256：${TGZ_SHA256}）"
-          ls -lh dist/
+          echo "✅ 打包完成：$BUNDLE_DIR/$TGZ_NAME（${TGZ_SIZE}，SHA256：${TGZ_SHA256}）"
+          ls -lh "$BUNDLE_DIR"
 
       # ---------------------------------------------------------------
-      # Step 10: 上传 TGZ Artifact
-      #   每次运行的产物通过时间戳区分，互不覆盖
-      #   注：Artifact 下载后为 zip 包，解压即得到 TGZ 文件
+      # Step 10: 上传打包目录 Artifact
+      #   upload-artifact 以所有文件的公共父目录为 zip 根目录，故这里上传 dist/
+      #   （而非单个文件），zip 解压后即为目录 <BUNDLE_NAME>/，内含 load.sh 与 TGZ
       # ---------------------------------------------------------------
       - name: 上传 Artifact（delivery_mode=pack）
         if: ${{ inputs.delivery_mode == 'pack' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
-          path: dist/${{ env.TGZ_NAME }}
+          path: dist/
           retention-days: 14
           if-no-files-found: error
 
@@ -1517,13 +1546,15 @@ jobs:
             fi
             echo ""
 
-            if [[ "$JOB_STATUS" == "success" && "$DELIVERY_MODE" == "pack" && -n "${TGZ_NAME:-}" && -f "dist/$TGZ_NAME" ]]; then
+            if [[ "$JOB_STATUS" == "success" && "$DELIVERY_MODE" == "pack" && -n "${TGZ_NAME:-}" && -f "${TGZ_PATH:-}" ]]; then
               echo "### ✅ 产出 Artifact"
               echo ""
               echo "| 项目 | 值 |"
               echo "|---|---|"
               echo "| Artifact 名称 | \`${ARTIFACT_NAME}\` |"
+              echo "| 解压后目录 | \`${BUNDLE_NAME}\` |"
               echo "| 文件名 | \`${TGZ_NAME}\` |"
+              echo "| 一键导入脚本 | \`load.sh\` |"
               echo "| 大小 | ${TGZ_SIZE:-?} |"
               echo "| SHA256 | \`${TGZ_SHA256:-?}\` |"
 
@@ -1542,16 +1573,19 @@ jobs:
               echo ""
               echo "### 目标服务器导入方法"
               echo ""
-              echo "从本次运行页面的 **Artifacts** 区域下载 \`${ARTIFACT_NAME}\`（下载得到 zip，解压即为本 TGZ 文件）："
+              echo "从本次运行页面的 **Artifacts** 区域下载 \`${ARTIFACT_NAME}\`（zip 解压后得到目录 \`${BUNDLE_NAME}/\`，内含 \`load.sh\` 与 \`${TGZ_NAME}\`）："
               echo ""
               echo '```bash'
-              echo "# 1. 校验完整性（可选，SHA256 见上表）"
-              echo "echo \"${TGZ_SHA256:-<sha256>}  ${TGZ_NAME}\" | sha256sum -c"
+              echo "# 1. 进入解压后的目录，一键导入"
+              echo "cd ${BUNDLE_NAME} && ./load.sh"
+              echo "# 提示：GitHub Artifact 解压后可能重置文件权限，若提示 Permission denied，"
+              echo "#       执行 chmod +x load.sh && ./load.sh，或直接用 bash load.sh"
               echo ""
-              echo "# 2. 导入全部镜像"
+              echo "# 或手动导入（先校验完整性，SHA256 见上表）"
+              echo "echo \"${TGZ_SHA256:-<sha256>}  ${TGZ_NAME}\" | sha256sum -c"
               echo "docker load -i <(gunzip -c ${TGZ_NAME})"
               echo ""
-              echo "# 3. 验证导入结果"
+              echo "# 2. 验证导入结果"
               echo "docker images"
               echo '```'
             elif [[ "$JOB_STATUS" == "success" && "$DELIVERY_MODE" == "push" ]]; then
