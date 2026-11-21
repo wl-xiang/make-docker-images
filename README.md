@@ -51,6 +51,7 @@
 | 参数名 | 类型 | 必填 | 默认值 | 说明 |
 |---|---|---|---|---|
 | `repo_url` | string | ✅ | 无 | 目标仓库克隆链接，如 `https://github.com/wl-xiang/code-server-ai.git` |
+| `repo_name` | string | ❌ | 空 | 自定义 `<repo-name>`：产物命名前缀（Artifact 名 / 解压后目录名 / TGZ 文件名），如 `my-project`。不能包含 `/` 或空白字符；留空默认取 `repo_url` 的项目名 |
 | `ref` | string | ❌ | 空 | 指定拉取的分支或 Tag，如 `dev`、`release/v1.0`、`v1.2.3`。留空表示不指定，拉取仓库默认分支的最新内容；指定后只拉取该分支/Tag 的内容（`--single-branch`），不拉取其他分支，可显著减少克隆耗时与磁盘占用 |
 | `platform` | choice | ✅ | `linux/amd64` | 目标部署平台：`linux/amd64` 或 `linux/arm64`。选 `linux/arm64` 时自动调度 GitHub **ARM 原生 Runner**（`ubuntu-24.04-arm`）原生构建，不走 QEMU 模拟 |
 | `build_mode` | choice | ✅ | `docker build` | 镜像获取模式，三选一：`docker build` / `compose pull` / `compose auto` |
@@ -250,7 +251,7 @@ build_mode = compose auto
 - `ref` **填写**后，克隆命令变为 `git clone --depth 1 --single-branch --branch <ref>`，**只拉取该分支或 Tag 的内容**，不会拉取其他分支，可显著减少克隆耗时与磁盘占用
 - Tag 会被检出为 **detached HEAD**（对应 Tag 的提交），不影响后续 Docker 构建/拉取
 - 分支名与 Tag 名区分大小写；若该 ref 不存在，克隆会失败并在 Summary 中给出提示
-- `ref` 不影响镜像命名与打包产物命名（产物名仍取自 `repo_url` 的项目名）
+- `ref` 不影响镜像命名与打包产物命名（产物名取自 `repo_name` 参数，留空时取 `repo_url` 的项目名）
 
 ## 产出物
 
@@ -271,7 +272,7 @@ build_mode = compose auto
         └── code-server-ai_docker-images_linux-amd64_20261009-1530.tgz
 ```
 
-- `<repo-name>`：取自 `repo_url` 的项目名（如 `https://github.com/wl-xiang/code-server-ai.git` → `code-server-ai`）
+- `<repo-name>`：产物命名前缀。优先取运行参数 `repo_name`（留空时取 `repo_url` 的项目名，如 `https://github.com/wl-xiang/code-server-ai.git` → `code-server-ai`）
 - `<platform>`：目标平台，`/` 替换为 `-`（如 `linux/amd64` → `linux-amd64`）
 - `<yyyymmdd-HHMM>`：打包时的北京时间戳
 - Artifact 名称与 zip 解压后的目录名相同，均为 `<repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>`（带时间戳，避免同一 run 重跑时冲突）

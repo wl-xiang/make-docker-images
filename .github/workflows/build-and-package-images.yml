@@ -71,6 +71,11 @@ on:
         required: false
         default: ''
         type: string
+      repo_name:
+        description: '自定义 <repo-name>：产物命名前缀（Artifact 名 / 解压后目录名 / TGZ 文件名），例如 my-project。不能包含 / 或空白字符；留空默认取 repo_url 的项目名'
+        required: false
+        default: ''
+        type: string
       platform:
         description: '目标部署服务器平台'
         required: true
@@ -1327,26 +1332,35 @@ jobs:
 
       # ---------------------------------------------------------------
       # Step 9: docker save 导出全部镜像，并压缩为 TGZ
-      #   产物目录：dist/<repo-name>_docker-images_<platform>/
-      #     ├── load.sh                                                （可执行，一键导入）
+      #   产物目录：dist/<repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>/
+      #     ├── load.sh / clean.sh / print.sh / images.txt
       #     └── <repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>.tgz
       #   Artifact 命名：<产物目录名>_<yyyymmdd-HHMM>（带时间戳，避免同一 run 重跑时冲突）
-      #   repo-name 取自 repo_url 的项目名；时间戳使用 Asia/Shanghai 时区
+      #   repo-name 优先取运行参数 repo_name，留空则取 repo_url 的项目名；时间戳使用 Asia/Shanghai 时区
       # ---------------------------------------------------------------
       - name: 导出镜像并压缩为 TGZ（delivery_mode=pack）
         if: ${{ inputs.delivery_mode == 'pack' }}
         env:
           REPO_URL: ${{ inputs.repo_url }}
+          INPUT_REPO_NAME: ${{ inputs.repo_name }}
           PLATFORM: ${{ inputs.platform }}
         run: |
           set -euo pipefail
 
-          # 从 repo_url 提取项目名：去掉可选结尾斜杠与 .git 后缀，取最后一段路径
-          REPO_NAME="${REPO_URL%/}"
-          REPO_NAME="${REPO_NAME%.git}"
-          REPO_NAME="${REPO_NAME##*/}"
+          # 产物命名前缀 <repo-name>：优先取运行参数 repo_name，留空则从 repo_url 提取项目名
+          # （去掉可选结尾斜杠与 .git 后缀，取最后一段路径）
+          REPO_NAME="${INPUT_REPO_NAME// /}"
           if [[ -z "$REPO_NAME" ]]; then
-            echo "::error::无法从 repo_url 解析出项目名：$REPO_URL"
+            REPO_NAME="${REPO_URL%/}"
+            REPO_NAME="${REPO_NAME%.git}"
+            REPO_NAME="${REPO_NAME##*/}"
+          fi
+          if [[ -z "$REPO_NAME" ]]; then
+            echo "::error::无法确定 <repo-name>（repo_name 参数为空，且无法从 repo_url 解析出项目名：$REPO_URL）"
+            exit 1
+          fi
+          if [[ "$REPO_NAME" =~ [/[:space:]] ]]; then
+            echo "::error::repo_name 不能包含 / 或空白字符，当前值：$REPO_NAME"
             exit 1
           fi
 
