@@ -1355,11 +1355,11 @@ jobs:
           # 北京时间戳，形如 20261009-1530
           TIMESTAMP="$(TZ='Asia/Shanghai' date +%Y%m%d-%H%M)"
 
-          # 解压后的目录名：<repo-name>_docker-images_<platform>
-          BUNDLE_NAME="${REPO_NAME}_docker-images_${PLATFORM_TAG}"
-          # Artifact 名带时间戳，避免同一 run 重跑（re-run）时与已有 Artifact 冲突
-          ARTIFACT_NAME="${BUNDLE_NAME}_${TIMESTAMP}"
-          TGZ_NAME="${BUNDLE_NAME}_${TIMESTAMP}.tgz"
+          # 解压后的目录名：<repo-name>_docker-images_<platform>_<时间戳>
+          # 目录名带时间戳（Asia/Shanghai，格式 YYYYMMDD-HHMM），多次下载的产物互不覆盖
+          BUNDLE_NAME="${REPO_NAME}_docker-images_${PLATFORM_TAG}_${TIMESTAMP}"
+          ARTIFACT_NAME="${BUNDLE_NAME}"
+          TGZ_NAME="${BUNDLE_NAME}.tgz"
           BUNDLE_DIR="dist/$BUNDLE_NAME"
 
           if [[ ! -s "$IMAGE_LIST_FILE" ]]; then
