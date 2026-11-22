@@ -276,7 +276,7 @@ build_mode = compose auto
 - `<platform>`：目标平台，`/` 替换为 `-`（如 `linux/amd64` → `linux-amd64`）
 - `<yyyymmdd-HHMM>`：打包时的北京时间戳
 - Artifact 名称与 zip 解压后的目录名相同，均为 `<repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>`（带时间戳，避免同一 run 重跑时冲突）
-- 内置脚本：`load.sh` 一键导入镜像；`clean.sh` 删除本包镜像（先打印 image-name 与 tag，`-y` 跳过确认）；`print.sh` 通过 `docker images | grep` 打印本包镜像在本机的加载情况；`images.txt` 为脚本共用的镜像清单
+- 内置脚本：`load.sh` 一键导入镜像；`clean.sh` 清理本包镜像（先自动 `docker stop` / `docker rm` 使用这些镜像的容器，最后 `docker rmi` 删除镜像；先打印 image-name 与 tag，`-y` 跳过确认）；`print.sh` 通过 `docker images | grep` 打印本包镜像在本机的加载情况；`images.txt` 为脚本共用的镜像清单
 - `docker build` 模式：包含 1 个镜像
 - `compose pull` 模式：包含 Compose 文件中声明的全部 `image:` 镜像
 - `compose auto` 模式：包含 Compose 中拉取的镜像 + 构建型服务的镜像（声明了 `image:` 者按该值，否则为 `<project>-<service>`）
@@ -298,7 +298,7 @@ cd code-server-ai_docker-images_linux-amd64_20261009-1530
 # 查看本包镜像的加载情况
 ./print.sh
 
-# 卸载/清理本包镜像（先打印 image-name 与 tag；-y 跳过确认）
+# 卸载/清理本包镜像（自动 stop/rm 使用这些镜像的容器后再 rmi；先打印清单，-y 跳过确认）
 ./clean.sh
 
 # 方式二：手动导入
