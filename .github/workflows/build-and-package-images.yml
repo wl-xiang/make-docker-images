@@ -1428,10 +1428,12 @@ jobs:
           # 生成镜像清单文件：clean.sh / print.sh 运行时读取，与 load.sh 导入的镜像一一对应
           printf '%s\n' "${IMAGES[@]}" > "$BUNDLE_DIR/images.txt"
 
-          # 生成一键删除脚本：删除本包包含的全部镜像，默认逐项确认，-y 跳过确认
+          # 生成一键删除脚本：先自动 stop / rm 使用这些镜像的容器，最后 rmi 删除镜像
+          # 默认逐项确认，-y 跳过确认
           cat > "$BUNDLE_DIR/clean.sh" <<'CLEAN_EOF'
           #!/usr/bin/env bash
-          # 一键删除本包镜像（与 load.sh 导入的镜像一一对应，列表见同目录 images.txt）
+          # 一键清理本包镜像及其容器（与 load.sh 导入的镜像一一对应，镜像列表见同目录 images.txt）
+          # 执行顺序：docker stop（停止使用这些镜像的容器）→ docker rm（删除容器）→ docker rmi（删除镜像）
           # 用法：./clean.sh [-y]    （-y 跳过删除前的确认提示）
           set -euo pipefail
 
@@ -1469,16 +1471,54 @@ jobs:
             printf '  - image-name: %-50s tag: %s\n' "${name}" "${tag}"
           done
 
+          # 收集使用上述镜像的容器（含已停止的），按容器 ID 去重
+          declare -A SEEN=()
+          CONTAINER_IDS=()
+          CONTAINER_LINES=()
+          for img in "${IMAGES[@]}"; do
+            while IFS=$'\t' read -r cid cname cstatus; do
+              [[ -z "${cid}" ]] && continue
+              [[ -n "${SEEN[${cid}]:-}" ]] && continue
+              SEEN[${cid}]=1
+              CONTAINER_IDS+=("${cid}")
+              CONTAINER_LINES+=("  - $(printf '%-40s %-14s %s' "${cname}" "${cid}" "${cstatus}")")
+            done < <(docker ps -a --filter "ancestor=${img}" --format '{{.ID}}\t{{.Names}}\t{{.Status}}' 2>/dev/null || true)
+          done
+
+          if [[ ${#CONTAINER_IDS[@]} -gt 0 ]]; then
+            echo ""
+            echo "检测到 ${#CONTAINER_IDS[@]} 个容器正在使用上述镜像，将先停止并删除："
+            printf '%s\n' "${CONTAINER_LINES[@]}"
+          fi
+
           if [[ ${ASSUME_YES} -ne 1 ]]; then
-            read -r -p "确认删除以上 ${#IMAGES[@]} 个镜像？[y/N] " answer
+            if [[ ${#CONTAINER_IDS[@]} -gt 0 ]]; then
+              read -r -p "确认停止并删除以上 ${#CONTAINER_IDS[@]} 个容器，再删除 ${#IMAGES[@]} 个镜像？[y/N] " answer
+            else
+              read -r -p "确认删除以上 ${#IMAGES[@]} 个镜像？[y/N] " answer
+            fi
             if [[ ! "${answer}" =~ ^[Yy]([Ee][Ss])?$ ]]; then
-              echo "已取消，未删除任何镜像"
+              echo "已取消，未做任何改动"
               exit 0
             fi
           fi
 
+          # 1) 停止使用这些镜像的容器（已停止的容器会被忽略）
+          # 2) 删除这些容器（rm 失败时回退 rm -f 兜底）
+          # 3) 删除镜像
+          if [[ ${#CONTAINER_IDS[@]} -gt 0 ]]; then
+            echo "🛑 停止容器（${#CONTAINER_IDS[@]} 个）..."
+            docker stop "${CONTAINER_IDS[@]}" >/dev/null 2>&1 || true
+
+            echo "🗑️  删除容器（${#CONTAINER_IDS[@]} 个）..."
+            docker rm "${CONTAINER_IDS[@]}" >/dev/null 2>&1 \
+              || docker rm -f "${CONTAINER_IDS[@]}" >/dev/null 2>&1 \
+              || true
+          fi
+
+          echo "🗑️  删除镜像（${#IMAGES[@]} 个）..."
           docker rmi "${IMAGES[@]}"
-          echo "✅ 镜像删除完成"
+          echo "✅ 容器与镜像已清理完成"
           CLEAN_EOF
           chmod +x "$BUNDLE_DIR/clean.sh"
 
@@ -1672,7 +1712,7 @@ jobs:
               echo "| 解压后目录 | \`${BUNDLE_NAME}\` |"
               echo "| 文件名 | \`${TGZ_NAME}\` |"
               echo "| 一键导入脚本 | \`load.sh\` |"
-              echo "| 一键删除脚本 | \`clean.sh\`（-y 跳过确认） |"
+              echo "| 一键清理脚本 | \`clean.sh\`（自动 stop/rm 使用这些镜像的容器后再 rmi，-y 跳过确认） |"
               echo "| 镜像查看脚本 | \`print.sh\`（docker images \| grep 镜像列表） |"
               echo "| 大小 | ${TGZ_SIZE:-?} |"
               echo "| SHA256 | \`${TGZ_SHA256:-?}\` |"
