@@ -28,7 +28,7 @@
 └─────────┬───────────┘
           │
           ▼
-  <repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>/ 目录（内含 load.sh、clean.sh、print.sh 与 TGZ，可下载，离线部署用）
+  Artifact zip（解压后为 load-zip.sh + <repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>/ 目录，目录内含 load.sh、clean.sh、check.sh 与 TGZ，可下载，离线部署用）
 ```
 
 ## 使用方法
@@ -43,7 +43,7 @@
 1. 进入本仓库的 GitHub 页面 → **Actions** 标签页
 2. 左侧选择 **Build and Package Docker Images** workflow
 3. 点击 **Run workflow**，填写参数后点击绿色 **Run workflow** 按钮
-4. 运行完成后，在该次运行页面底部的 **Artifacts** 区域下载产物（下载得到 zip，解压后得到目录 `<repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>/`，内含 `load.sh`、`clean.sh`、`print.sh` 与 TGZ 文件）
+4. 运行完成后，在该次运行页面底部的 **Artifacts** 区域下载产物（下载得到 zip，解压后得到 `load-zip.sh` 与目录 `<repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>/`，目录内含 `load.sh`、`clean.sh`、`check.sh` 与 TGZ 文件）
 5. 运行页面的 **Summary** 区域会显示本次运行的摘要：输入参数、产出文件名/大小/SHA256、镜像清单（架构 + 大小）、目标服务器导入命令
 
 ### 输入参数说明
@@ -258,25 +258,29 @@ build_mode = compose auto
 每次运行产出一个 Artifact，命名规范：
 
 ```
-<repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>/
-├── load.sh
-├── clean.sh
-├── print.sh
-├── images.txt
-└── <repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>.tgz
-例如：code-server-ai_docker-images_linux-amd64_20261009-1530/
-        ├── load.sh
-        ├── clean.sh
-        ├── print.sh
-        ├── images.txt
-        └── code-server-ai_docker-images_linux-amd64_20261009-1530.tgz
+Artifact zip（<repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>.zip）
+├── load-zip.sh                      # 一键解压脚本（解压 zip → 删除 zip → 询问是否执行 load.sh）
+└── <repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>/
+    ├── load.sh
+    ├── clean.sh
+    ├── check.sh
+    ├── images.txt
+    └── <repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>.tgz
+例如：code-server-ai_docker-images_linux-amd64_20261009-1530.zip
+        ├── load-zip.sh
+        └── code-server-ai_docker-images_linux-amd64_20261009-1530/
+            ├── load.sh
+            ├── clean.sh
+            ├── check.sh
+            ├── images.txt
+            └── code-server-ai_docker-images_linux-amd64_20261009-1530.tgz
 ```
 
 - `<repo-name>`：产物命名前缀。优先取运行参数 `repo_name`（留空时取 `repo_url` 的项目名，如 `https://github.com/wl-xiang/code-server-ai.git` → `code-server-ai`）
 - `<platform>`：目标平台，`/` 替换为 `-`（如 `linux/amd64` → `linux-amd64`）
 - `<yyyymmdd-HHMM>`：打包时的北京时间戳
 - Artifact 名称与 zip 解压后的目录名相同，均为 `<repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>`（带时间戳，避免同一 run 重跑时冲突）
-- 内置脚本：`load.sh` 一键导入镜像；`clean.sh` 清理本包镜像（先自动 `docker stop` / `docker rm` 使用这些镜像的容器，最后 `docker rmi` 删除镜像；先打印 image-name 与 tag，`-y` 跳过确认）；`print.sh` 通过 `docker images | grep` 打印本包镜像在本机的加载情况；`images.txt` 为脚本共用的镜像清单
+- 内置脚本：`load.sh` 一键导入镜像；`clean.sh` 清理本包镜像（先自动 `docker stop` / `docker rm` 使用这些镜像的容器，最后 `docker rmi` 删除镜像；先打印 image-name 与 tag，`-y` 跳过确认）；`check.sh` 逐个 `docker image inspect` 校验本包镜像是否已在本机加载（存在缺失时以非 0 退出）；`load-zip.sh` 位于 zip 根目录，负责解压 zip、删除 zip 并在确认后执行 `load.sh`（输入 `y` 自动执行）；`images.txt` 为脚本共用的镜像清单
 - `docker build` 模式：包含 1 个镜像
 - `compose pull` 模式：包含 Compose 文件中声明的全部 `image:` 镜像
 - `compose auto` 模式：包含 Compose 中拉取的镜像 + 构建型服务的镜像（声明了 `image:` 者按该值，否则为 `<project>-<service>`）
@@ -286,22 +290,27 @@ build_mode = compose auto
 
 ### 下载后在目标服务器导入
 
-从 run 页面 **Artifacts** 区域下载（例如 `code-server-ai_docker-images_linux-amd64_20261009-1530`，下载得到的是 zip，**解压后得到目录 `code-server-ai_docker-images_linux-amd64_20261009-1530/`**，内含 `load.sh`、`clean.sh`、`print.sh` 与 TGZ）：
+从 run 页面 **Artifacts** 区域下载（例如 `code-server-ai_docker-images_linux-amd64_20261009-1530.zip`）。zip 根目录含 `load-zip.sh` 与目录 `code-server-ai_docker-images_linux-amd64_20261009-1530/`（内含 `load.sh`、`clean.sh`、`check.sh`、`images.txt` 与 TGZ）：
 
 ```bash
-# 方式一：一键导入（推荐）
+# 方式一（推荐）：只解压出 load-zip.sh，由它完成「解压 → 删除 zip → 询问并导入」
+unzip code-server-ai_docker-images_linux-amd64_20261009-1530.zip load-zip.sh
+chmod +x load-zip.sh && ./load-zip.sh
+# 脚本会解压 zip 并删除 zip，然后询问是否立即执行该包内的 load.sh，输入 y 自动导入
+
+# 方式二：完整解压后进入目录，一键导入
 cd code-server-ai_docker-images_linux-amd64_20261009-1530
 ./load.sh
 # 注：GitHub Artifact 解压后可能重置文件权限，若提示 Permission denied，
 #     执行 chmod +x load.sh && ./load.sh，或直接用 bash load.sh
 
-# 查看本包镜像的加载情况
-./print.sh
+# 检查本包镜像是否已全部加载（逐个 docker image inspect 校验）
+./check.sh
 
 # 卸载/清理本包镜像（自动 stop/rm 使用这些镜像的容器后再 rmi；先打印清单，-y 跳过确认）
 ./clean.sh
 
-# 方式二：手动导入
+# 方式三：手动导入
 # 0. 校验完整性（可选，SHA256 值见 run 页面的 Summary）
 echo "<summary 中的 sha256>  code-server-ai_docker-images_linux-amd64_20261009-1530.tgz" | sha256sum -c
 
@@ -439,7 +448,7 @@ A: 取决于 `env_write_mode`：`create`（默认）只在 `.env` 不存在时�
 A: 不建议。`env_content` 的值会保存在 workflow 运行记录中（公开仓库对可见者公开），敏感值请改用仓库 Secrets，仅将非敏感的配置项写入 `env_content`。
 
 **Q: 下载的 Artifact 是 `.zip` 而不是 `.tgz`？**
-A: 正常现象。GitHub Actions 下载 Artifact 时会自动套一层 zip；解压后得到目录 `<repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>/`，其中包含 `load.sh`、`clean.sh`、`print.sh` 与 TGZ 文件，进入目录执行 `./load.sh` 即可一键导入。
+A: 正常现象。GitHub Actions 下载 Artifact 时会自动套一层 zip；解压后得到 `load-zip.sh` 与目录 `<repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>/`，其中包含 `load.sh`、`clean.sh`、`check.sh`、`images.txt` 与 TGZ 文件。可先只解压出 `load-zip.sh` 再执行它（自动解压 + 删除 zip + 询问是否导入），也可进入目录执行 `./load.sh` 一键导入。
 
 **Q: 报错 `镜像的架构为 ... 与目标平台不符`？**
 A: 打包前会校验每个镜像的架构。若出现该报错，说明镜像本身不支持目标架构（如仅提供 amd64 版本却选择了 arm64），需联系镜像作者或更换镜像。
