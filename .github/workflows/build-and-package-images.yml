@@ -11,8 +11,7 @@
 #
 # 两种交付方式（delivery_mode）：
 #   pack : 将全部镜像 docker save 并压缩为 TGZ，连同 load.sh / clean.sh / check.sh 一起打包为
-#          目录上传到 Artifacts（默认）；Artifact zip 根目录另含 load-zip.sh（一键解压 +
-#          删除 zip + 询问是否导入），解压后可直接执行 ./load.sh 或 ./load-zip.sh 一键导入
+#          目录上传到 Artifacts（默认）；解压后进入目录直接执行 ./load.sh 一键导入
 #   push : 将全部镜像重新打标签为 ghcr.io/<owner>/<repo>/<镜像名>:<tag> 并推送到 GHCR；
 #          并生成 docker-compose-ghcr.yml（所有 image: 已替换为 GHCR 地址、build: 段已移除）
 #          上传为 Artifact（docker-compose-ghcr），摘要中给出拉取命令与国内加速代理
@@ -1336,8 +1335,6 @@ jobs:
       #   产物目录：dist/<repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>/
       #     ├── load.sh / clean.sh / check.sh / images.txt
       #     └── <repo-name>_docker-images_<platform>_<yyyymmdd-HHMM>.tgz
-      #   另在 dist/ 根目录生成 load-zip.sh（提前 chmod +x）：Artifact zip 解压后
-      #   与 bundle 目录同级，执行它会解压 zip、删除 zip，并询问是否执行 load.sh
       #   Artifact 命名：<产物目录名>_<yyyymmdd-HHMM>（带时间戳，避免同一 run 重跑时冲突）
       #   repo-name 优先取运行参数 repo_name，留空则取 repo_url 的项目名；时间戳使用 Asia/Shanghai 时区
       # ---------------------------------------------------------------
@@ -1574,65 +1571,6 @@ jobs:
           CHECK_EOF
           chmod +x "$BUNDLE_DIR/check.sh"
 
-          # 生成 zip 一键解压脚本（放在 dist 根目录，与 bundle 目录同级，随 Artifact zip 一起分发）：
-          # 下载的 <ARTIFACT_NAME>.zip 解压后，zip 根目录同时包含该脚本与 bundle 目录；
-          # 执行本脚本会：unzip <ARTIFACT_NAME>.zip → 删除该 zip → 询问是否立即执行
-          # <BUNDLE_NAME>/load.sh（输入 y 自动执行）
-          cat > "dist/load-zip.sh" <<EOF
-          #!/usr/bin/env bash
-          # 一键解压并导入本 Artifact
-          # 用法：把下载的 ${ARTIFACT_NAME}.zip 与本脚本放在同一目录（或只解压出本脚本），执行 ./load-zip.sh
-          # 流程：解压 ${ARTIFACT_NAME}.zip → 删除该 zip → 询问是否立即执行 ${BUNDLE_NAME}/load.sh（输入 y 自动执行）
-          set -euo pipefail
-
-          ZIP_NAME="${ARTIFACT_NAME}.zip"
-          BUNDLE_DIR_NAME="${BUNDLE_NAME}"
-
-          SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
-
-          # 依次在脚本目录、当前目录、脚本父目录中查找 zip（兼容不同的下载/解压方式）
-          ZIP_PATH=""
-          for cand in "\${SCRIPT_DIR}/\${ZIP_NAME}" "\${PWD}/\${ZIP_NAME}" "\${SCRIPT_DIR}/../\${ZIP_NAME}"; do
-            if [[ -f "\${cand}" ]]; then
-              ZIP_PATH="\${cand}"
-              break
-            fi
-          done
-
-          if [[ -z "\${ZIP_PATH}" ]]; then
-            echo "错误：未找到 \${ZIP_NAME}" >&2
-            echo "请将下载的 \${ZIP_NAME} 与本脚本放在同一目录后重试" >&2
-            exit 1
-          fi
-
-          if ! command -v unzip >/dev/null 2>&1; then
-            echo "错误：未找到 unzip 命令，请先安装（如 apt-get install -y unzip）" >&2
-            exit 1
-          fi
-
-          WORK_DIR="\$(cd "\$(dirname "\${ZIP_PATH}")" && pwd)"
-          echo "正在解压 \${ZIP_NAME} 到 \${WORK_DIR} ..."
-          unzip -o "\${ZIP_PATH}" -d "\${WORK_DIR}"
-          rm -f "\${ZIP_PATH}"
-          echo "✅ 已解压并删除 \${ZIP_NAME}"
-
-          LOAD_SH="\${WORK_DIR}/\${BUNDLE_DIR_NAME}/load.sh"
-          if [[ ! -f "\${LOAD_SH}" ]]; then
-            echo "⚠️ 未找到 \${LOAD_SH}，请手动进入 \${BUNDLE_DIR_NAME}/ 执行 load.sh" >&2
-            exit 1
-          fi
-
-          answer=""
-          read -r -p "是否立即执行 \${BUNDLE_DIR_NAME}/load.sh 导入镜像？[y/N] " answer || true
-          if [[ "\${answer}" =~ ^[Yy]([Ee][Ss])?\$ ]]; then
-            echo "▶️  执行 \${LOAD_SH}"
-            bash "\${LOAD_SH}"
-          else
-            echo "已跳过导入。稍后可手动执行：cd \${BUNDLE_DIR_NAME} && bash load.sh"
-          fi
-          EOF
-          chmod +x "dist/load-zip.sh"
-
           {
             echo "ARTIFACT_NAME=$ARTIFACT_NAME"
             echo "BUNDLE_NAME=$BUNDLE_NAME"
@@ -1648,7 +1586,7 @@ jobs:
       # ---------------------------------------------------------------
       # Step 10: 上传打包目录 Artifact
       #   upload-artifact 以所有文件的公共父目录为 zip 根目录，故这里上传 dist/
-      #   （而非单个文件），zip 解压后即为：load-zip.sh + 目录 <BUNDLE_NAME>/
+      #   （而非单个文件），zip 解压后即为目录 <BUNDLE_NAME>/
       #   （目录内含 load.sh、clean.sh、check.sh、images.txt 与 TGZ）
       # ---------------------------------------------------------------
       - name: 上传 Artifact（delivery_mode=pack）
@@ -1775,9 +1713,8 @@ jobs:
               echo "| 项目 | 值 |"
               echo "|---|---|"
               echo "| Artifact 名称 | \`${ARTIFACT_NAME}\` |"
-              echo "| 解压后内容 | \`load-zip.sh\` + 目录 \`${BUNDLE_NAME}/\` |"
+              echo "| 解压后内容 | 目录 \`${BUNDLE_NAME}/\` |"
               echo "| 文件名 | \`${TGZ_NAME}\` |"
-              echo "| 一键解压脚本 | \`load-zip.sh\`（解压 zip → 删除 zip → 询问是否执行 load.sh） |"
               echo "| 一键导入脚本 | \`load.sh\` |"
               echo "| 一键清理脚本 | \`clean.sh\`（自动 stop/rm 使用这些镜像的容器后再 rmi，-y 跳过确认） |"
               echo "| 加载检查脚本 | \`check.sh\`（逐个 docker image inspect 校验本包镜像是否已加载） |"
@@ -1799,14 +1736,10 @@ jobs:
               echo ""
               echo "### 目标服务器导入方法"
               echo ""
-              echo "从本次运行页面的 **Artifacts** 区域下载 \`${ARTIFACT_NAME}\`（zip 解压后得到 \`load-zip.sh\` 与目录 \`${BUNDLE_NAME}/\`，目录内含 \`load.sh\`、\`clean.sh\`、\`check.sh\`、\`images.txt\` 与 \`${TGZ_NAME}\`）："
+              echo "从本次运行页面的 **Artifacts** 区域下载 \`${ARTIFACT_NAME}\`（zip 解压后得到目录 \`${BUNDLE_NAME}/\`，目录内含 \`load.sh\`、\`clean.sh\`、\`check.sh\`、\`images.txt\` 与 \`${TGZ_NAME}\`）："
               echo ""
               echo '```bash'
-              echo "# 方式一（推荐）：只解压出 load-zip.sh，由它完成「解压 → 删除 zip → 询问并导入」"
-              echo "unzip ${ARTIFACT_NAME}.zip load-zip.sh"
-              echo "chmod +x load-zip.sh && ./load-zip.sh   # 询问是否执行 load.sh 时输入 y 即自动导入"
-              echo ""
-              echo "# 方式二：进入解压后的目录，一键导入"
+              echo "# 一键导入：进入解压后的目录执行"
               echo "cd ${BUNDLE_NAME} && ./load.sh"
               echo "# 提示：GitHub Artifact 解压后可能重置文件权限，若提示 Permission denied，"
               echo "#       执行 chmod +x load.sh && ./load.sh，或直接用 bash load.sh"
