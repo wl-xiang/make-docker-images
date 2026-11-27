@@ -689,6 +689,7 @@ jobs:
           DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
           IMAGE_NAME: ${{ inputs.image_name }}
           PLATFORM: ${{ inputs.platform }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -720,11 +721,21 @@ jobs:
           fi
 
           echo "🔨 开始构建镜像 $IMAGE_NAME（平台：$PLATFORM，Dockerfile：$DOCKERFILE_PATH）"
-          if ! docker buildx build --platform "$PLATFORM" --load -f "$DOCKERFILE_PATH" -t "$IMAGE_NAME" .; then
+          # 将 GITHUB_TOKEN 以 BuildKit secret 传给构建：Dockerfile 中执行 git 的 RUN 可通过
+          # --mount=type=secret,id=gh_token 消费，为 git 操作提供认证。GitHub 会对共享出口 IP
+          # 的匿名 git 请求返回 404（表现为 'could not read Username for https://github.com'，
+          # 公开仓库也不例外），认证请求可绕过该限制；Dockerfile 未消费此 secret 时传入无副作用。
+          BUILD_SECRET_ARGS=()
+          if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+            BUILD_SECRET_ARGS+=(--secret id=gh_token,env=GITHUB_TOKEN)
+          fi
+          if ! docker buildx build --platform "$PLATFORM" --load -f "$DOCKERFILE_PATH" -t "$IMAGE_NAME" "${BUILD_SECRET_ARGS[@]}" .; then
             echo "::error::镜像构建失败，请检查 Dockerfile 内容及其依赖的网络资源是否可访问"
             echo "若日志中出现 'JavaScript heap out of memory'，是 Node.js 默认堆上限（约 4GB）不足："
             echo "  可将 node_heap 输入参数调大（如 12GB），本 workflow 会自动向 Dockerfile 注入 ENV NODE_OPTIONS；"
             echo "  Dockerfile 结构特殊时也可通过 hook_command 手动插入（示例见 README FAQ）"
+            echo "若日志中出现 'could not read Username for https://github.com'，多为 GitHub 对匿名 git 访问限流（公开仓库也会遇到）："
+            echo "  请通过 hook_command 为 Dockerfile 中执行 git 的 RUN 注入 --mount=type=secret,id=gh_token 并配置凭据改写（示例见 README FAQ）"
             exit 1
           fi
 
