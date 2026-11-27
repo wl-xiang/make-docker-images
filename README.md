@@ -432,6 +432,25 @@ hook_command  = sed -i 's/gcc-x86-64-linux-gnu/gcc-x86-64-linux-gnu libc6-dev-am
 >
 > 若只是想要官方 RustFS 镜像而非本地编译：改用 `docker build` 模式 + `dockerfile_path=Dockerfile`（该 Dockerfile 直接下载官方预编译二进制，无需在 Runner 上编译 Rust）。
 
+**Q: 构建中 git 步骤报 `could not read Username for 'https://github.com': No such device or address`？**
+
+A: 这通常是 **GitHub 对匿名 git 访问的限流**，不是目标仓库私有——`microsoft/onnxruntime` 等公开仓库在共享出口 IP（GitHub 托管 Runner、数据中心代理等）上也可能被返回 404，git 会把它当作私有仓库尝试交互式输入凭据，而 Docker 构建没有 TTY，直接失败。反复重试无效，因为 404 是持续性的，不是瞬时网络抖动。
+
+**推荐做法**：本 workflow 已自动向 `docker buildx build` 传入 `--secret id=gh_token,env=GITHUB_TOKEN`，只需用 `hook_command` 给目标 Dockerfile 中执行 `git` 的 `RUN` 注入 secret 挂载，并配置凭据改写。认证请求可绕过该限流。以 siyuan（其 Dockerfile 在 `onnx-source` 阶段下载 onnxruntime 源码及子模块）为例：
+
+```
+repo_url      = https://github.com/siyuan-note/siyuan.git
+build_mode    = docker build
+hook_command  = python3 -c 'import io; p="Dockerfile"; s=io.open(p,encoding="utf-8").read(); old="RUN <<EORUN\n#!/bin/sh -e\nretry() {"; new="RUN --mount=type=secret,id=gh_token,target=/run/secrets/gh_token <<EORUN\n#!/bin/sh -e\nif [ -s /run/secrets/gh_token ]; then\n    export GIT_CONFIG_COUNT=1\n    export GIT_CONFIG_KEY_0=\"url.https://x-access-token:$(cat /run/secrets/gh_token)@github.com/.insteadOf\"\n    export GIT_CONFIG_VALUE_0=https://github.com/\nfi\nretry() {"; s2=s.replace(old,new,1); assert s2!=s or "id=gh_token" in s, "onnx RUN heredoc not found"; io.open(p,"w",encoding="utf-8").write(s2); print("gh_token secret patched")'
+```
+
+> 说明：
+> - 补丁把 siyuan `Dockerfile` 中下载 onnxruntime 源码的 `RUN <<EORUN` 改为 `RUN --mount=type=secret,id=gh_token,...`，并在脚本开头注入 `GIT_CONFIG_*` 环境变量实现 `url.<token>@github.com` → `https://github.com/` 的 insteadOf 改写。token 经 BuildKit secret 注入且只存在于运行期环境变量中，不会写入镜像层或构建日志；脚本已做幂等处理（重复执行不会二次打补丁）。
+> - `GIT_CONFIG_*` 环境变量会被 `git submodule update` 的子进程继承，子模块下载同样获得认证。
+> - 若目标 Dockerfile 不是 siyuan，请按相同思路调整匹配规则：`RUN` 行追加 `--mount=type=secret,id=gh_token,target=/run/secrets/gh_token`，脚本内在读取到该文件时配置 insteadOf 改写。
+> - 自维护 Dockerfile 也可直接提交上述等价修改，无需 hook_command。
+> - 该方案目前适用于 `docker build` 模式（`docker compose build` 暂不支持从 CLI 传入 secret）。
+
 **Q: 报错 `钩子命令执行失败`？**
 A: `hook_command` 会在目标仓库根目录执行。依次检查：① 命令拼写与参数是否正确（可先在本地目标仓库根目录验证）；② 脚本是否存在且可执行——不可执行时改用 `bash setup.sh` 形式；③ 脚本依赖的工具（如 `pnpm` / `corepack` / `python`）在 `ubuntu-latest` Runner 上是否可用（Runner 预装 node/python/docker/git 等，`pnpm` 可通过 `corepack enable` 启用，必要时把启用命令一并写入 `hook_command`）。
 
